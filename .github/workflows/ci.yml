@@ -1,0 +1,126 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck + bash syntax
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          bash -n install.sh
+          shellcheck -s bash -S warning install.sh tests/incontainer.sh tests/docker-matrix.sh
+      - name: PowerShell parse + PSScriptAnalyzer
+        run: |
+          docker run --rm -v "$PWD:/src:ro" mcr.microsoft.com/powershell:ubuntu-24.04 pwsh -NoProfile -c '
+            $t=$null; $e=$null
+            [System.Management.Automation.Language.Parser]::ParseFile("/src/install.ps1",[ref]$t,[ref]$e) | Out-Null
+            if ($e -and $e.Count) { $e | ForEach-Object { "$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+            Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+            Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+            $r = Invoke-ScriptAnalyzer -Path /src/install.ps1 -Severity Error,Warning
+            if ($r) { $r | Format-Table -AutoSize | Out-String | Write-Host; exit 1 }
+            Write-Host "clean"
+          '
+
+  docker-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:24.04
+          - debian:12
+          - fedora:42
+          - archlinux:latest
+          - alpine:3.21
+          - opensuse/leap:15.6
+    steps:
+      - uses: actions/checkout@v4
+      - name: install + verify + idempotency (${{ matrix.image }})
+        run: tests/docker-matrix.sh "${{ matrix.image }}"
+
+  os-matrix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Unix (macOS / Linux) ----
+      - name: install (unix)
+        if: runner.os != 'Windows'
+        run: bash install.sh --all --yes --mirror off
+      - name: verify (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          . "$HOME/.config/dev-kit/env.sh"
+          git --version
+          java -version
+          mvn -v | head -1
+          gradle -v | grep -i '^Gradle'
+          go version
+          cargo --version
+          node --version
+          pnpm --version
+          bun --version
+      - name: re-run idempotency (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          h1=$(sha256sum "$HOME/.config/dev-kit/env.sh" | cut -d' ' -f1)
+          bash install.sh --all --yes --mirror off
+          h2=$(sha256sum "$HOME/.config/dev-kit/env.sh" | cut -d' ' -f1)
+          test "$h1" = "$h2" || { echo "env.sh changed on re-run"; exit 1; }
+      - name: uninstall (unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -e
+          bash install.sh --uninstall --all --yes
+          test ! -e "$HOME/.config/dev-kit" || { echo "dev-kit config not removed"; exit 1; }
+          test ! -e "$HOME/.local/share/dev-kit" || { echo "dev-kit data not removed"; exit 1; }
+
+      # ---- Windows PowerShell 5.1 (scriptblock form exercises the irm|iex path) ----
+      - name: install (windows, powershell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -All -Yes -Mirror off
+      - name: verify (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          . "$env:LOCALAPPDATA\dev-kit\env.ps1"
+          Use-Jdk (Get-Content -Raw "$env:LOCALAPPDATA\dev-kit\jdk\default").Trim()
+          git --version
+          java -version
+          mvn -v
+          gradle -v
+          go version
+          cargo --version
+          node --version
+          pnpm --version
+          bun --version
+      - name: re-run idempotency (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $h1 = (Get-FileHash "$env:LOCALAPPDATA\dev-kit\env.ps1" -Algorithm SHA256).Hash
+          & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -All -Yes -Mirror off
+          $h2 = (Get-FileHash "$env:LOCALAPPDATA\dev-kit\env.ps1" -Algorithm SHA256).Hash
+          if ($h1 -ne $h2) { Write-Error "env.ps1 changed on re-run"; exit 1 }
+      - name: uninstall (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -Uninstall -All -Yes
+          if (Test-Path "$env:LOCALAPPDATA\dev-kit") { Write-Error "dev-kit dir not removed"; exit 1 }

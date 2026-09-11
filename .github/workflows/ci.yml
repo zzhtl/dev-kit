@@ -68,7 +68,17 @@ jobs:
       # ---- Unix (macOS / Linux) ----
       - name: install (unix)
         if: runner.os != 'Windows'
-        run: bash install.sh --all --yes --mirror off
+        run: |
+          bash install.sh --all --yes --mirror off 2>&1 | tee "$RUNNER_TEMP/dk.log"
+          exit ${PIPESTATUS[0]}
+      # TEMPORARY (diagnostics): job logs need admin rights to download, annotations do not
+      - name: surface the failure (unix)
+        if: failure() && runner.os != 'Windows'
+        run: |
+          m=$( { grep -nE 'err |failed at line|failed:' "$RUNNER_TEMP/dk.log" | tail -15
+                 echo '---- tail ----'
+                 tail -25 "$RUNNER_TEMP/dk.log"; } | sed 's/%/%25/g; s/\r//' | awk '{printf "%s%%0A", $0}' )
+          echo "::error title=dk-unix::$m"
       - name: verify (unix)
         if: runner.os != 'Windows'
         run: |
@@ -104,7 +114,26 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -All -Yes -Mirror off
+          $log = Join-Path $env:RUNNER_TEMP 'dk.log'
+          try {
+            & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -All -Yes -Mirror off *>&1 |
+              ForEach-Object { $s = [string]$_; Write-Host $s; Add-Content -LiteralPath $log -Value $s }
+          } catch {
+            $m = "EXCEPTION $($_.Exception.GetType().Name): $($_.Exception.Message) @line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line)"
+            Write-Host $m
+            Add-Content -LiteralPath $log -Value $m
+            exit 1
+          }
+      # TEMPORARY (diagnostics): job logs need admin rights to download, annotations do not
+      - name: surface the failure (windows)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'dk.log'
+          if (Test-Path $log) {
+            $t = ((Get-Content $log -Tail 40) | ForEach-Object { $_ -replace '%', '%25' }) -join '%0A'
+          } else { $t = '(no log written)' }
+          Write-Host "::error title=dk-win::$t"
       - name: verify (windows)
         if: runner.os == 'Windows'
         shell: pwsh

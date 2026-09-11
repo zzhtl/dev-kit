@@ -290,7 +290,8 @@ dk_upsert_block() {
       $0==b {while ((getline l < rf) > 0) print l; close(rf); skip=1; next}
       $0==e {skip=0; next}
       skip!=1 {print}
-    ' "$file" > "$file.dk.tmp" && mv "$file.dk.tmp" "$file"
+    ' "$file" > "$file.dk.tmp" && mv "$file.dk.tmp" "$file" || {
+      rm -f "$file.dk.tmp"; dk_warn "could not rewrite the dev-kit block in $file"; }
     rm -f "$rf"
   else
     printf '\n%s\n' "$block" >> "$file"
@@ -303,7 +304,9 @@ dk_remove_block() {
     $0==b {skip=1; next}
     $0==e {skip=0; next}
     skip!=1 {print}
-  ' "$file" > "$file.dk.tmp" && mv "$file.dk.tmp" "$file"
+  ' "$file" > "$file.dk.tmp" && mv "$file.dk.tmp" "$file" || {
+    rm -f "$file.dk.tmp"; dk_warn "could not rewrite $file"; }
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1430,6 +1433,7 @@ dk_remove_rc_blocks() {
   for f in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.zprofile" "$HOME/.profile"; do
     [ -f "$f" ] && dk_remove_block "$f" "# >>> dev-kit >>>" "# <<< dev-kit <<<"
   done
+  return 0
 }
 
 dk_jdk_all_tem_ids() {

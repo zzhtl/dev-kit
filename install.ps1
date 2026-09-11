@@ -21,6 +21,10 @@
 # Write-Host is the deliberate UI channel for this installer; empty catch blocks are
 # intentional best-effort cleanup; the internal Set-/Update-/Remove- helpers do not
 # take pipeline input and never need -WhatIf, so ShouldProcess would only add noise.
+# No BOM on purpose: a BOM makes `irm <url>/install.ps1 | iex` fail (the leading
+# U+FEFF ends up inside the parsed text). The only non-ASCII left in the file is in
+# comments -- every Chinese UI string is stored as \uXXXX escapes.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseBOMForUnicodeEncodedFile', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '')]
 [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '')]
@@ -37,6 +41,9 @@ param(
     [switch]$NoShellInit,
     [switch]$Uninstall,
     [switch]$KeepCache,
+    [ValidateSet('zh', 'en', '')]
+    [string]$Lang = '',
+    [switch]$NoTui,
     [switch]$Help
 )
 
@@ -63,10 +70,16 @@ function Show-DevKitUsage {
     Write-Host @'
 dev-kit installer (Windows)
 
+Run it with no arguments and you get an interactive menu: pick install or
+uninstall, tick the components with the arrow keys and space, and review every
+option before it runs. Every choice also has a parameter, so scripts never
+need the menu.
+
 Usage:
   .\install.ps1 [-All] [-With jdk,go,rust,git,node,bun,maven,gradle,pnpm] [-Yes]
                 [-JdkVersion 21,25] [-GoVersion 1.27.1] [-RustVersion stable|1.90.0]
-                [-NodeVersion lts|24] [-Mirror auto|cn|off] [-NoShellInit] [-Help]
+                [-NodeVersion lts|24] [-Mirror auto|cn|off] [-NoShellInit]
+                [-Lang zh|en] [-NoTui] [-Help]
 
 One-liner from the web (parameters need the scriptblock form):
   & ([scriptblock]::Create((irm <url>/install.ps1))) -All -Yes
@@ -103,6 +116,10 @@ if ($PSBoundParameters.Count -eq 0 -and $env:DEVKIT_ARGS) {
             '--remove'       { $Uninstall = $true }
             '-keepcache'     { $KeepCache = $true }
             '--keep-cache'   { $KeepCache = $true }
+            '-notui'         { $NoTui = $true }
+            '--no-tui'       { $NoTui = $true }
+            '-lang'          { $i++; if ($i -lt $toks.Count) { $Lang = $toks[$i] } }
+            '--lang'         { $i++; if ($i -lt $toks.Count) { $Lang = $toks[$i] } }
             '-help'          { $Help = $true }
             '--help'         { $Help = $true }
             '-with'          { $i++; if ($i -lt $toks.Count) { $With = $toks[$i] -split ',' } }
@@ -1316,7 +1333,7 @@ function Complete-DevKitUninstall {
 
 function Invoke-DevKitUninstall {
     param([string[]]$Components)
-    if (-not $Yes) {
+    if (-not $Yes -and -not $script:WizConfirmed) {
         Write-Host ''
         Write-Host "About to UNINSTALL: $($Components -join ', ')" -ForegroundColor Yellow
         if ($KeepCache) { Write-Host 'Removes the toolchains and dev-kit config (caches kept).' }
@@ -1361,15 +1378,753 @@ function Invoke-DevKitUninstall {
 }
 
 # ----------------------------------------------------------------------------
+# i18n - interactive UI strings only (progress output stays English)
+#
+# The Chinese strings are stored as \uXXXX escapes so this file stays pure
+# ASCII: Windows PowerShell 5.1 reads a BOM-less script with the ANSI code
+# page (which would mangle UTF-8 text), and adding a BOM would break
+# `irm ... | iex`. The readable text is in the comment above each entry.
+# ----------------------------------------------------------------------------
+$script:TextZh = @{
+    # 选择要执行的操作
+    'mode.title'   = '\u9009\u62e9\u8981\u6267\u884c\u7684\u64cd\u4f5c'
+    # 安装 / 更新组件
+    'mode.install' = '\u5b89\u88c5 / \u66f4\u65b0\u7ec4\u4ef6'
+    # 卸载组件
+    'mode.uninst'  = '\u5378\u8f7d\u7ec4\u4ef6'
+    # 退出
+    'mode.quit'    = '\u9000\u51fa'
+    # 勾选要安装 / 更新的组件
+    'pick.install' = '\u52fe\u9009\u8981\u5b89\u88c5 / \u66f4\u65b0\u7684\u7ec4\u4ef6'
+    # 勾选要卸载的组件（* = 已安装）
+    'pick.uninst'  = '\u52fe\u9009\u8981\u5378\u8f7d\u7684\u7ec4\u4ef6\uff08* = \u5df2\u5b89\u88c5\uff09'
+    # 安装选项
+    'opts.title'   = '\u5b89\u88c5\u9009\u9879'
+    # 卸载选项
+    'opts.titleu'  = '\u5378\u8f7d\u9009\u9879'
+    # ↑/↓ 移动   空格 勾选   回车 确认
+    'hint.chk1'    = '\u2191/\u2193 \u79fb\u52a8   \u7a7a\u683c \u52fe\u9009   \u56de\u8f66 \u786e\u8ba4'
+    # a 全选   n 全不选   i 反选   q 退出
+    'hint.chk2'    = 'a \u5168\u9009   n \u5168\u4e0d\u9009   i \u53cd\u9009   q \u9000\u51fa'
+    # ↑/↓ 移动   回车 选择   q 退出
+    'hint.menu1'   = '\u2191/\u2193 \u79fb\u52a8   \u56de\u8f66 \u9009\u62e9   q \u9000\u51fa'
+    # 输入后回车；留空用默认值
+    'hint.input'   = '\u8f93\u5165\u540e\u56de\u8f66\uff1b\u7559\u7a7a\u7528\u9ed8\u8ba4\u503c'
+    # JDK 主版本
+    'lbl.jdk'      = 'JDK \u4e3b\u7248\u672c'
+    # Go 版本
+    'lbl.go'       = 'Go \u7248\u672c'
+    # Rust 工具链
+    'lbl.rust'     = 'Rust \u5de5\u5177\u94fe'
+    # Node 版本
+    'lbl.node'     = 'Node \u7248\u672c'
+    # 镜像源
+    'lbl.mirror'   = '\u955c\u50cf\u6e90'
+    # 写入 PowerShell 配置
+    'lbl.shell'    = '\u5199\u5165 PowerShell \u914d\u7f6e'
+    # 保留缓存
+    'lbl.cache'    = '\u4fdd\u7559\u7f13\u5b58'
+    # 开始安装
+    'act.start'    = '\u5f00\u59cb\u5b89\u88c5'
+    # 开始卸载
+    'act.startu'   = '\u5f00\u59cb\u5378\u8f7d'
+    # 返回上一步
+    'act.back'     = '\u8fd4\u56de\u4e0a\u4e00\u6b65'
+    # 最新版
+    'val.latest'   = '\u6700\u65b0\u7248'
+    # 最新 LTS
+    'val.lts'      = '\u6700\u65b0 LTS'
+    # 手动输入…
+    'val.custom'   = '\u624b\u52a8\u8f93\u5165\u2026'
+    # 默认
+    'val.default'  = '\u9ed8\u8ba4'
+    # 是
+    'val.yes'      = '\u662f'
+    # 否
+    'val.no'       = '\u5426'
+    # auto — 探测网络后自动选择
+    'val.auto'     = 'auto \u2014 \u63a2\u6d4b\u7f51\u7edc\u540e\u81ea\u52a8\u9009\u62e9'
+    # cn — 使用国内镜像
+    'val.cn'       = 'cn \u2014 \u4f7f\u7528\u56fd\u5185\u955c\u50cf'
+    # off — 只用官方源
+    'val.off'      = 'off \u2014 \u53ea\u7528\u5b98\u65b9\u6e90'
+    # Go 版本号，例如 1.27.1
+    'in.go'        = 'Go \u7248\u672c\u53f7\uff0c\u4f8b\u5982 1.27.1'
+    # Rust 版本号，例如 1.90.0
+    'in.rust'      = 'Rust \u7248\u672c\u53f7\uff0c\u4f8b\u5982 1.90.0'
+    # Node 主版本号，例如 24
+    'in.node'      = 'Node \u4e3b\u7248\u672c\u53f7\uff0c\u4f8b\u5982 24'
+    # 即将安装 / 更新：
+    'sum.install'  = '\u5373\u5c06\u5b89\u88c5 / \u66f4\u65b0\uff1a'
+    # 即将卸载：
+    'sum.uninst'   = '\u5373\u5c06\u5378\u8f7d\uff1a'
+    # 将删除工具链、缓存和 dev-kit 自身的配置
+    'sum.u1'       = '\u5c06\u5220\u9664\u5de5\u5177\u94fe\u3001\u7f13\u5b58\u548c dev-kit \u81ea\u8eab\u7684\u914d\u7f6e'
+    # 将删除工具链和 dev-kit 自身的配置（保留缓存）
+    'sum.u1k'      = '\u5c06\u5220\u9664\u5de5\u5177\u94fe\u548c dev-kit \u81ea\u8eab\u7684\u914d\u7f6e\uff08\u4fdd\u7559\u7f13\u5b58\uff09'
+    # 你自己写的配置文件不会被删除
+    'sum.u2'       = '\u4f60\u81ea\u5df1\u5199\u7684\u914d\u7f6e\u6587\u4ef6\u4e0d\u4f1a\u88ab\u5220\u9664'
+    # 确认执行？
+    'sum.ask'      = '\u786e\u8ba4\u6267\u884c\uff1f'
+    # 已取消
+    'msg.cancel'   = '\u5df2\u53d6\u6d88'
+    # 没有勾选任何组件
+    'msg.none'     = '\u6ca1\u6709\u52fe\u9009\u4efb\u4f55\u7ec4\u4ef6'
+    # 当前没有由 dev-kit 安装的组件
+    'msg.noinst'   = '\u5f53\u524d\u6ca1\u6709\u7531 dev-kit \u5b89\u88c5\u7684\u7ec4\u4ef6'
+    # 正在获取可用版本…
+    'msg.loading'  = '\u6b63\u5728\u83b7\u53d6\u53ef\u7528\u7248\u672c\u2026'
+    # 格式不对，请重新输入
+    'msg.badver'   = '\u683c\u5f0f\u4e0d\u5bf9\uff0c\u8bf7\u91cd\u65b0\u8f93\u5165'
+    'desc.git'     = 'Git'
+    # JDK（Temurin）
+    'desc.jdk'     = 'JDK\uff08Temurin\uff09'
+    'desc.maven'   = 'Apache Maven'
+    'desc.gradle'  = 'Gradle'
+    'desc.go'      = 'Go'
+    # Rust（rustup）
+    'desc.rust'    = 'Rust\uff08rustup\uff09'
+    # Node.js（经 fnm）
+    'desc.node'    = 'Node.js\uff08\u7ecf fnm\uff09'
+    'desc.pnpm'    = 'pnpm'
+    'desc.bun'     = 'Bun'
+}
+
+$script:TextEn = @{
+    'mode.title'   = 'what would you like to do?'
+    'mode.install' = 'install / update components'
+    'mode.uninst'  = 'uninstall components'
+    'mode.quit'    = 'quit'
+    'pick.install' = 'select components to install / update'
+    'pick.uninst'  = 'select components to uninstall (* = installed)'
+    'opts.title'   = 'install options'
+    'opts.titleu'  = 'uninstall options'
+    'hint.chk1'    = 'up/down move   space toggle   enter confirm'
+    'hint.chk2'    = 'a all   n none   i invert   q quit'
+    'hint.menu1'   = 'up/down move   enter select   q quit'
+    'hint.input'   = 'type and press enter; empty keeps the default'
+    'lbl.jdk'      = 'JDK majors'
+    'lbl.go'       = 'Go version'
+    'lbl.rust'     = 'Rust toolchain'
+    'lbl.node'     = 'Node version'
+    'lbl.mirror'   = 'mirrors'
+    'lbl.shell'    = 'write the PowerShell profile'
+    'lbl.cache'    = 'keep caches'
+    'act.start'    = 'start install'
+    'act.startu'   = 'start uninstall'
+    'act.back'     = 'back'
+    'val.latest'   = 'latest'
+    'val.lts'      = 'latest LTS'
+    'val.custom'   = 'enter manually...'
+    'val.default'  = 'default'
+    'val.yes'      = 'yes'
+    'val.no'       = 'no'
+    'val.auto'     = 'auto - probe the network'
+    'val.cn'       = 'cn - China mirrors'
+    'val.off'      = 'off - upstream only'
+    'in.go'        = 'Go version, e.g. 1.27.1'
+    'in.rust'      = 'Rust version, e.g. 1.90.0'
+    'in.node'      = 'Node major, e.g. 24'
+    'sum.install'  = 'about to install / update: '
+    'sum.uninst'   = 'about to uninstall: '
+    'sum.u1'       = 'removes the toolchains, their caches and dev-kit config'
+    'sum.u1k'      = 'removes the toolchains and dev-kit config (caches kept)'
+    'sum.u2'       = 'your own config files are kept'
+    'sum.ask'      = 'proceed?'
+    'msg.cancel'   = 'cancelled'
+    'msg.none'     = 'nothing selected'
+    'msg.noinst'   = 'nothing installed by dev-kit'
+    'msg.loading'  = 'fetching available versions...'
+    'msg.badver'   = 'invalid version, try again'
+    'desc.git'     = 'Git'
+    'desc.jdk'     = 'JDK (Temurin)'
+    'desc.maven'   = 'Apache Maven'
+    'desc.gradle'  = 'Gradle'
+    'desc.go'      = 'Go'
+    'desc.rust'    = 'Rust (rustup)'
+    'desc.node'    = 'Node.js (via fnm)'
+    'desc.pnpm'    = 'pnpm'
+    'desc.bun'     = 'Bun'
+}
+
+$script:UiLang = 'en'   # separate from the -Lang parameter, which is script-scoped too
+$script:UiCursor = '>'
+$script:UiGo = '> '
+$script:UiBack = '< '
+$script:UiDot = '*'
+$script:UiTop = 0
+$script:UiNote = @()
+$script:UiEncoding = $null
+$script:WizSelected = $null
+$script:WizInstalled = @()
+$script:WizJdk = @()
+$script:WizConfirmed = $false
+
+function Expand-DevKitEscape {
+    param([string]$Text)
+    if ($Text -notmatch '\\u') { return $Text }
+    return [regex]::Replace($Text, '\\u([0-9a-fA-F]{4})', {
+            param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+}
+
+function Get-DevKitText {
+    param([string]$Key)
+    if ($script:UiLang -eq 'zh' -and $script:TextZh.ContainsKey($Key)) {
+        return (Expand-DevKitEscape $script:TextZh[$Key])
+    }
+    if ($script:TextEn.ContainsKey($Key)) { return $script:TextEn[$Key] }
+    return $Key
+}
+
+function Get-DevKitComponentDesc {
+    param([string]$Name)
+    return (Get-DevKitText "desc.$Name")
+}
+
+function Initialize-DevKitLang {
+    $want = $Lang
+    if (-not $want) { $want = $env:DEVKIT_LANG }
+    if ($want) {
+        if ($want -match '^(zh|cn)') { $script:UiLang = 'zh' } else { $script:UiLang = 'en' }
+    } else {
+        $culture = ''
+        try { $culture = [System.Globalization.CultureInfo]::CurrentUICulture.Name } catch { $culture = '' }
+        if ($culture -like 'zh*') { $script:UiLang = 'zh' } else { $script:UiLang = 'en' }
+    }
+    # the box-drawing marks and any Chinese need a UTF-8 console
+    $utf8 = $false
+    try {
+        $script:UiEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false
+        $utf8 = $true
+    } catch { $utf8 = $false }
+    if ($utf8) {
+        $script:UiCursor = Expand-DevKitEscape '\u25b8'
+        $script:UiGo     = (Expand-DevKitEscape '\u25b6') + ' '
+        $script:UiBack   = (Expand-DevKitEscape '\u2190') + ' '
+        $script:UiDot    = Expand-DevKitEscape '\u25cf'
+    } elseif ($script:UiLang -eq 'zh') {
+        $script:UiLang = 'en'
+    }
+}
+
+function Restore-DevKitConsole {
+    if ($null -ne $script:UiEncoding) {
+        try { [Console]::OutputEncoding = $script:UiEncoding } catch { }
+        $script:UiEncoding = $null
+    }
+    try { [Console]::CursorVisible = $true } catch { }
+}
+
+# ----------------------------------------------------------------------------
+# terminal UI: arrow keys + checkboxes
+# ----------------------------------------------------------------------------
+function Test-DevKitTui {
+    if ($NoTui) { return $false }
+    if ($env:DEVKIT_NO_TUI -eq '1') { return $false }
+    if (-not [Environment]::UserInteractive) { return $false }
+    try {
+        if ([Console]::IsInputRedirected) { return $false }
+        if ([Console]::WindowWidth -lt 44) { return $false }
+    } catch { return $false }
+    return $true
+}
+
+# CJK glyphs take two columns; PadRight counts one, so measure it properly
+function Get-DevKitDisplayWidth {
+    param([string]$Text)
+    $n = 0
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [int][char]$ch
+        if (($c -ge 0x1100 -and $c -le 0x115F) -or ($c -ge 0x2E80 -and $c -le 0xA4CF) -or
+            ($c -ge 0xAC00 -and $c -le 0xD7A3) -or ($c -ge 0xF900 -and $c -le 0xFAFF) -or
+            ($c -ge 0xFE30 -and $c -le 0xFE6F) -or ($c -ge 0xFF00 -and $c -le 0xFF60) -or
+            ($c -ge 0xFFE0 -and $c -le 0xFFE6)) { $n += 2 } else { $n += 1 }
+    }
+    return $n
+}
+
+function Get-DevKitFrameWidth {
+    $w = 80
+    try { $w = [Console]::WindowWidth - 1 } catch { $w = 80 }
+    if ($w -lt 20) { $w = 20 }
+    return $w
+}
+
+# $Line: array of @{ T = text; C = colour name or '' }
+function Show-DevKitFrame {
+    param([object[]]$Line)
+    $w = Get-DevKitFrameWidth
+    try { [Console]::SetCursorPosition(0, $script:UiTop) } catch { }
+    foreach ($l in $Line) {
+        $t = [string]$l.T
+        $pad = $w - (Get-DevKitDisplayWidth $t)
+        if ($pad -gt 0) { $t = $t + (' ' * $pad) }
+        if ($l.C) { Write-Host $t -ForegroundColor $l.C } else { Write-Host $t }
+    }
+    try {
+        $script:UiTop = [Console]::CursorTop - $Line.Count
+        if ($script:UiTop -lt 0) { $script:UiTop = 0 }
+    } catch { }
+}
+
+function Clear-DevKitFrame {
+    param([int]$Count)
+    $w = Get-DevKitFrameWidth
+    try {
+        [Console]::SetCursorPosition(0, $script:UiTop)
+        for ($i = 0; $i -lt $Count; $i++) { Write-Host (' ' * $w) }
+        [Console]::SetCursorPosition(0, $script:UiTop)
+    } catch { }
+}
+
+function Get-DevKitHeaderLine {
+    param([string]$Title)
+    $out = @()
+    $out += @{ T = ''; C = '' }
+    $out += @{ T = "  dev-kit $script:DevKitVersion  $Title"; C = 'Cyan' }
+    $out += @{ T = ''; C = '' }
+    foreach ($n in $script:UiNote) { $out += @{ T = $n; C = 'Yellow' } }
+    if ($script:UiNote.Count -gt 0) { $out += @{ T = ''; C = '' } }
+    return $out
+}
+
+function Get-DevKitFooterLine {
+    param([string[]]$Hint)
+    $out = @()
+    $out += @{ T = ''; C = '' }
+    foreach ($h in $Hint) { $out += @{ T = "  $h"; C = 'DarkGray' } }
+    return $out
+}
+
+function Read-DevKitKey {
+    $k = $null
+    try { $k = [Console]::ReadKey($true) } catch { return 'quit' }
+    switch ($k.Key) {
+        'UpArrow'   { return 'up' }
+        'DownArrow' { return 'down' }
+        'Enter'     { return 'enter' }
+        'Spacebar'  { return 'space' }
+        'Escape'    { return 'quit' }
+    }
+    $c = "$($k.KeyChar)".ToLower()
+    if ($c -match '^[1-9]$') { return "digit:$c" }
+    switch ($c) {
+        'k' { return 'up' }
+        'j' { return 'down' }
+        'a' { return 'all' }
+        'n' { return 'none' }
+        'i' { return 'invert' }
+        'q' { return 'quit' }
+    }
+    return 'other'
+}
+
+# returns the ticked items, or $null when the user backs out
+function Show-DevKitChecklist {
+    param(
+        [string]$Title,
+        [string[]]$Item,
+        [string[]]$Selected,
+        [scriptblock]$LabelFn,
+        [scriptblock]$MarkFn
+    )
+    if ($Item.Count -eq 0) { return ,@() }
+    $sel = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($s in $Selected) { [void]$sel.Add($s) }
+    $cur = 0
+    $count = 0
+    try { [Console]::CursorVisible = $false } catch { }
+    $script:UiTop = 0
+    try { $script:UiTop = [Console]::CursorTop } catch { }
+    while ($true) {
+        $lines = Get-DevKitHeaderLine $Title
+        for ($i = 0; $i -lt $Item.Count; $i++) {
+            $c = $Item[$i]
+            $box = ' '
+            if ($sel.Contains($c)) { $box = 'x' }
+            $ptr = ' '
+            if ($i -eq $cur) { $ptr = $script:UiCursor }
+            $mark = '  '
+            if ($MarkFn) { $mark = [string](& $MarkFn $c) }
+            $label = ''
+            if ($LabelFn) { $label = [string](& $LabelFn $c) }
+            $row = '  {0} [{1}] {2} {3}{4}' -f $ptr, $box, $c.PadRight(7), $mark, $label
+            if ($i -eq $cur) { $lines += @{ T = $row; C = 'Green' } } else { $lines += @{ T = $row; C = '' } }
+        }
+        $lines += Get-DevKitFooterLine @((Get-DevKitText 'hint.chk1'), (Get-DevKitText 'hint.chk2'))
+        $count = $lines.Count
+        Show-DevKitFrame $lines
+        $key = Read-DevKitKey
+        switch -Regex ($key) {
+            '^up$'     { $cur--; if ($cur -lt 0) { $cur = $Item.Count - 1 } }
+            '^down$'   { $cur++; if ($cur -ge $Item.Count) { $cur = 0 } }
+            '^space$'  { $c = $Item[$cur]; if ($sel.Contains($c)) { [void]$sel.Remove($c) } else { [void]$sel.Add($c) } }
+            '^digit:'  {
+                $n = [int]($key -replace '^digit:', '') - 1
+                if ($n -ge 0 -and $n -lt $Item.Count) {
+                    $c = $Item[$n]
+                    if ($sel.Contains($c)) { [void]$sel.Remove($c) } else { [void]$sel.Add($c) }
+                }
+            }
+            '^all$'    { foreach ($c in $Item) { [void]$sel.Add($c) } }
+            '^none$'   { $sel.Clear() }
+            '^invert$' {
+                $keep = @($Item | Where-Object { -not $sel.Contains($_) })
+                $sel.Clear()
+                foreach ($c in $keep) { [void]$sel.Add($c) }
+            }
+            '^enter$'  {
+                Clear-DevKitFrame $count
+                return ,@($Item | Where-Object { $sel.Contains($_) })
+            }
+            '^quit$'   { Clear-DevKitFrame $count; return $null }
+        }
+    }
+}
+
+# returns the chosen item, or $null when the user backs out
+function Show-DevKitChoice {
+    param(
+        [string]$Title,
+        [string[]]$Item,
+        [string]$Marked,
+        [string]$Cursor,
+        [scriptblock]$LabelFn
+    )
+    if ($Item.Count -eq 0) { return $null }
+    $cur = 0
+    for ($i = 0; $i -lt $Item.Count; $i++) { if ($Item[$i] -eq $Cursor) { $cur = $i } }
+    $count = 0
+    try { [Console]::CursorVisible = $false } catch { }
+    $script:UiTop = 0
+    try { $script:UiTop = [Console]::CursorTop } catch { }
+    while ($true) {
+        $lines = Get-DevKitHeaderLine $Title
+        for ($i = 0; $i -lt $Item.Count; $i++) {
+            $ptr = ' '
+            if ($i -eq $cur) { $ptr = $script:UiCursor }
+            $dot = ' '
+            if ($Marked -and $Item[$i] -eq $Marked) { $dot = $script:UiDot }
+            $label = $Item[$i]
+            if ($LabelFn) { $label = [string](& $LabelFn $Item[$i]) }
+            $row = '  {0} {1} {2}' -f $ptr, $dot, $label
+            if ($i -eq $cur) { $lines += @{ T = $row; C = 'Green' } } else { $lines += @{ T = $row; C = '' } }
+        }
+        $lines += Get-DevKitFooterLine @((Get-DevKitText 'hint.menu1'))
+        $count = $lines.Count
+        Show-DevKitFrame $lines
+        $key = Read-DevKitKey
+        switch -Regex ($key) {
+            '^up$'    { $cur--; if ($cur -lt 0) { $cur = $Item.Count - 1 } }
+            '^down$'  { $cur++; if ($cur -ge $Item.Count) { $cur = 0 } }
+            '^digit:' {
+                $n = [int]($key -replace '^digit:', '') - 1
+                if ($n -ge 0 -and $n -lt $Item.Count) { $cur = $n }
+            }
+            '^(enter|space)$' { Clear-DevKitFrame $count; return $Item[$cur] }
+            '^quit$'  { Clear-DevKitFrame $count; return $null }
+        }
+    }
+}
+
+# free-text entry; '' means "keep the default"
+function Read-DevKitLine {
+    param([string]$Title, [string]$Default)
+    $lines = Get-DevKitHeaderLine $Title
+    if ($Default) { $lines += @{ T = "  $(Get-DevKitText 'val.default'): $Default"; C = 'DarkGray' } }
+    $lines += Get-DevKitFooterLine @((Get-DevKitText 'hint.input'))
+    Show-DevKitFrame $lines
+    try { [Console]::CursorVisible = $true } catch { }
+    $answer = Read-Host '  >'
+    try { [Console]::CursorVisible = $false } catch { }
+    Clear-DevKitFrame ($lines.Count + 1)
+    if ($null -eq $answer) { return '' }
+    return $answer.Trim()
+}
+
+# $true / $false, or $null when the user backs out
+function Show-DevKitYesNo {
+    param([string]$Title, [bool]$Default)
+    $want = 'no'
+    if ($Default) { $want = 'yes' }
+    $pick = Show-DevKitChoice -Title $Title -Item @('yes', 'no') -Marked $want -Cursor $want `
+        -LabelFn { param($x) if ($x -eq 'yes') { Get-DevKitText 'val.yes' } else { Get-DevKitText 'val.no' } }
+    if ($null -eq $pick) { return $null }
+    return ($pick -eq 'yes')
+}
+
+# ----------------------------------------------------------------------------
+# interactive wizard: mode -> components -> options -> run
+# ----------------------------------------------------------------------------
+function Get-DevKitAvailableJdkMajor {
+    try {
+        $info = Get-DevKitJson 'https://api.adoptium.net/v3/info/available_releases'
+        return @($info.available_releases | ForEach-Object { [int]$_ } | Where-Object { $_ -ge 21 } | Sort-Object)
+    } catch { return @(21, 25, 26) }
+}
+
+function Get-DevKitWizardOptionItem {
+    if ($Uninstall) { return @('cache', 'startu', 'back') }
+    $items = @()
+    foreach ($c in @('jdk', 'go', 'rust', 'node')) {
+        if ($script:WizSelected -contains $c) { $items += $c }
+    }
+    return @($items + @('mirror', 'shell', 'start', 'back'))
+}
+
+function Get-DevKitWizardOptionLabel {
+    param([string]$Key)
+    switch ($Key) {
+        'jdk'    { return "$(Get-DevKitText 'lbl.jdk'): $($script:WizJdk -join ' ')" }
+        'go'     { $v = $GoVersion; if (-not $v) { $v = Get-DevKitText 'val.latest' }
+                   return "$(Get-DevKitText 'lbl.go'): $v" }
+        'rust'   { $v = $RustVersion; if (-not $v) { $v = 'stable' }
+                   return "$(Get-DevKitText 'lbl.rust'): $v" }
+        'node'   { $v = $NodeVersion; if (-not $v) { $v = Get-DevKitText 'val.lts' }
+                   return "$(Get-DevKitText 'lbl.node'): $v" }
+        'mirror' { return "$(Get-DevKitText 'lbl.mirror'): $Mirror" }
+        'shell'  { $v = Get-DevKitText 'val.yes'; if ($NoShellInit) { $v = Get-DevKitText 'val.no' }
+                   return "$(Get-DevKitText 'lbl.shell'): $v" }
+        'cache'  { $v = Get-DevKitText 'val.no'; if ($KeepCache) { $v = Get-DevKitText 'val.yes' }
+                   return "$(Get-DevKitText 'lbl.cache'): $v" }
+        'start'  { return "$script:UiGo$(Get-DevKitText 'act.start')" }
+        'startu' { return "$script:UiGo$(Get-DevKitText 'act.startu')" }
+        'back'   { return "$script:UiBack$(Get-DevKitText 'act.back')" }
+    }
+    return $Key
+}
+
+function Get-DevKitWizardChoiceLabel {
+    param([string]$Key)
+    switch ($Key) {
+        'latest' { return (Get-DevKitText 'val.latest') }
+        'lts'    { return (Get-DevKitText 'val.lts') }
+        'custom' { return (Get-DevKitText 'val.custom') }
+        'auto'   { return (Get-DevKitText 'val.auto') }
+        'cn'     { return (Get-DevKitText 'val.cn') }
+        'off'    { return (Get-DevKitText 'val.off') }
+    }
+    return $Key
+}
+
+function Read-DevKitWizardVersion {
+    param([string]$PromptKey, [string]$Current, [string]$Pattern)
+    $title = Get-DevKitText $PromptKey
+    while ($true) {
+        $answer = Read-DevKitLine -Title $title -Default $Current
+        if (-not $answer) { return '' }
+        if ($answer -match $Pattern) { return $answer }
+        $title = "$(Get-DevKitText $PromptKey)   $(Get-DevKitText 'msg.badver')"
+    }
+}
+
+function Invoke-DevKitWizardOption {
+    param([string]$Key)
+    switch ($Key) {
+        'jdk' {
+            Show-DevKitFrame @(@{ T = "  $(Get-DevKitText 'msg.loading')"; C = 'DarkGray' })
+            $avail = @(Get-DevKitAvailableJdkMajor | ForEach-Object { [string]$_ })
+            Clear-DevKitFrame 1
+            $pick = Show-DevKitChecklist -Title (Get-DevKitText 'lbl.jdk') -Item $avail `
+                -Selected @($script:WizJdk) -LabelFn { param($x) $null = $x; '' } -MarkFn $null
+            if ($null -ne $pick -and @($pick).Count -gt 0) { $script:WizJdk = @($pick) }
+        }
+        'go' {
+            $marked = 'latest'
+            if ($GoVersion) { $marked = 'custom' }
+            $pick = Show-DevKitChoice -Title (Get-DevKitText 'lbl.go') -Item @('latest', 'custom') `
+                -Marked $marked -Cursor $marked -LabelFn ${function:Get-DevKitWizardChoiceLabel}
+            if ($pick -eq 'latest') { $script:GoVersion = '' }
+            elseif ($pick -eq 'custom') {
+                $v = Read-DevKitWizardVersion -PromptKey 'in.go' -Current $GoVersion -Pattern '^\d+\.\d+(\.\d+)?$'
+                if ($v) { $script:GoVersion = $v }
+            }
+        }
+        'rust' {
+            $marked = 'custom'
+            if (-not $RustVersion) { $marked = 'stable' }
+            elseif (@('stable', 'beta', 'nightly') -contains $RustVersion) { $marked = $RustVersion }
+            $pick = Show-DevKitChoice -Title (Get-DevKitText 'lbl.rust') `
+                -Item @('stable', 'beta', 'nightly', 'custom') -Marked $marked -Cursor $marked `
+                -LabelFn ${function:Get-DevKitWizardChoiceLabel}
+            if ($pick -eq 'stable') { $script:RustVersion = '' }
+            elseif ($pick -eq 'custom') {
+                $v = Read-DevKitWizardVersion -PromptKey 'in.rust' -Current $RustVersion -Pattern '^\d+\.\d+(\.\d+)?$'
+                if ($v) { $script:RustVersion = $v }
+            } elseif ($pick) { $script:RustVersion = $pick }
+        }
+        'node' {
+            $marked = 'lts'
+            if ($NodeVersion -and $NodeVersion -ne 'lts') { $marked = 'custom' }
+            $pick = Show-DevKitChoice -Title (Get-DevKitText 'lbl.node') -Item @('lts', 'custom') `
+                -Marked $marked -Cursor $marked -LabelFn ${function:Get-DevKitWizardChoiceLabel}
+            if ($pick -eq 'lts') { $script:NodeVersion = '' }
+            elseif ($pick -eq 'custom') {
+                $v = Read-DevKitWizardVersion -PromptKey 'in.node' -Current $NodeVersion -Pattern '^\d+$'
+                if ($v) { $script:NodeVersion = $v }
+            }
+        }
+        'mirror' {
+            $pick = Show-DevKitChoice -Title (Get-DevKitText 'lbl.mirror') -Item @('auto', 'cn', 'off') `
+                -Marked $Mirror -Cursor $Mirror -LabelFn ${function:Get-DevKitWizardChoiceLabel}
+            if ($pick) { $script:Mirror = $pick }
+        }
+        'shell' {
+            $yes = Show-DevKitYesNo -Title (Get-DevKitText 'lbl.shell') -Default (-not $NoShellInit)
+            if ($null -ne $yes) { $script:NoShellInit = (-not $yes) }
+        }
+        'cache' {
+            $yes = Show-DevKitYesNo -Title (Get-DevKitText 'lbl.cache') -Default ([bool]$KeepCache)
+            if ($null -ne $yes) { $script:KeepCache = $yes }
+        }
+    }
+}
+
+# $true = go ahead, $false = back to the component picker
+function Show-DevKitWizardOption {
+    $cursor = 'start'
+    if ($Uninstall) { $cursor = 'startu' }
+    while ($true) {
+        $title = Get-DevKitText 'opts.title'
+        $note = Get-DevKitText 'sum.install'
+        if ($Uninstall) {
+            $title = Get-DevKitText 'opts.titleu'
+            $note = Get-DevKitText 'sum.uninst'
+        }
+        $script:UiNote = @("  $note$($script:WizSelected -join ' ')")
+        $pick = Show-DevKitChoice -Title $title -Item (Get-DevKitWizardOptionItem) -Marked '' `
+            -Cursor $cursor -LabelFn ${function:Get-DevKitWizardOptionLabel}
+        $script:UiNote = @()
+        if ($null -eq $pick) { return $false }
+        $cursor = $pick
+        if ($pick -eq 'start' -or $pick -eq 'startu') { return $true }
+        if ($pick -eq 'back') { return $false }
+        Invoke-DevKitWizardOption -Key $pick
+    }
+}
+
+function Show-DevKitWizardPicker {
+    $script:WizInstalled = @(Get-DevKitInstalledComponent)
+    if ($Uninstall -and $script:WizInstalled.Count -eq 0) {
+        Restore-DevKitConsole
+        Write-DevKitErr (Get-DevKitText 'msg.noinst')
+        exit 1
+    }
+    $title = Get-DevKitText 'pick.install'
+    if ($Uninstall) { $title = Get-DevKitText 'pick.uninst' }
+    # coming back from a later step: keep what was ticked, do not reset it
+    $pre = @()
+    if ($script:WizSelected) { $pre = @($script:WizSelected) } elseif (-not $Uninstall) { $pre = $script:WizInstalled }
+    while ($true) {
+        if ($Uninstall) {
+            $pick = Show-DevKitChecklist -Title $title -Item $script:AllComponents -Selected $pre `
+                -LabelFn ${function:Get-DevKitComponentDesc} `
+                -MarkFn { param($x) if ($script:WizInstalled -contains $x) { '* ' } else { '  ' } }
+        } else {
+            $pick = Show-DevKitChecklist -Title $title -Item $script:AllComponents -Selected $pre `
+                -LabelFn ${function:Get-DevKitComponentDesc} -MarkFn $null
+        }
+        if ($null -eq $pick) { return $false }
+        if (@($pick).Count -gt 0) { $script:WizSelected = @($pick); return $true }
+        $title = "$(Get-DevKitText 'pick.install')   $(Get-DevKitText 'msg.none')"
+        if ($Uninstall) { $title = "$(Get-DevKitText 'pick.uninst')   $(Get-DevKitText 'msg.none')" }
+    }
+}
+
+function Show-DevKitWizardConfirm {
+    $note = Get-DevKitText 'sum.u1'
+    if ($KeepCache) { $note = Get-DevKitText 'sum.u1k' }
+    $script:UiNote = @(
+        "  $(Get-DevKitText 'sum.uninst')$($script:WizSelected -join ' ')",
+        "  $note",
+        "  $(Get-DevKitText 'sum.u2')"
+    )
+    $yes = Show-DevKitYesNo -Title (Get-DevKitText 'sum.ask') -Default $false
+    $script:UiNote = @()
+    return ($yes -eq $true)
+}
+
+function Invoke-DevKitWizard {
+    $step = 1
+    if ($Uninstall) { $step = 2 }
+    $modeForced = [bool]$Uninstall
+    try {
+        while ($true) {
+            switch ($step) {
+                1 {
+                    $pick = Show-DevKitChoice -Title (Get-DevKitText 'mode.title') `
+                        -Item @('install', 'uninstall', 'quit') -Marked '' -Cursor 'install' `
+                        -LabelFn { param($x)
+                            if ($x -eq 'install') { Get-DevKitText 'mode.install' }
+                            elseif ($x -eq 'uninstall') { Get-DevKitText 'mode.uninst' }
+                            else { Get-DevKitText 'mode.quit' } }
+                    if ($null -eq $pick -or $pick -eq 'quit') {
+                        Restore-DevKitConsole
+                        Write-DevKitInfo (Get-DevKitText 'msg.cancel')
+                        exit 0
+                    }
+                    if ($pick -eq 'uninstall') { $script:Uninstall = $true } else { $script:Uninstall = $false }
+                    $step = 2
+                }
+                2 {
+                    if (-not (Show-DevKitWizardPicker)) {
+                        if ($modeForced) {
+                            Restore-DevKitConsole
+                            Write-DevKitInfo (Get-DevKitText 'msg.cancel')
+                            exit 0
+                        }
+                        $step = 1
+                    } else {
+                        if (-not $Uninstall -and ($script:WizSelected -contains 'jdk') -and $script:WizJdk.Count -eq 0) {
+                            if ($JdkVersion) {
+                                $script:WizJdk = @($JdkVersion)
+                            } else {
+                                Show-DevKitFrame @(@{ T = "  $(Get-DevKitText 'msg.loading')"; C = 'DarkGray' })
+                                $script:WizJdk = @([string](Get-DevKitDefaultJdkMajor))
+                                Clear-DevKitFrame 1
+                            }
+                        }
+                        $step = 3
+                    }
+                }
+                3 {
+                    if (Show-DevKitWizardOption) {
+                        if ($Uninstall) { $step = 4 } else { $step = 9 }
+                    } else { $step = 2 }
+                }
+                4 {
+                    if (Show-DevKitWizardConfirm) { $step = 9 } else { $step = 3 }
+                }
+                9 {
+                    $script:WizConfirmed = $true
+                    if (-not $Uninstall -and $script:WizJdk.Count -gt 0) { $script:JdkVersion = @($script:WizJdk) }
+                    return
+                }
+            }
+        }
+    } finally {
+        Restore-DevKitConsole
+    }
+}
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 $script:RustMsvcMissing = $false
 $script:Yes = [bool]$Yes
 
+if (-not $All -and -not $With -and -not $Yes -and (Test-DevKitTui)) {
+    Initialize-DevKitLang
+    Invoke-DevKitWizard
+}
+
 if ($Uninstall) {
     $installed = Get-DevKitInstalledComponent
     $usel = @()
-    if ($All) {
+    if ($script:WizSelected) {
+        $usel = $script:WizSelected
+    } elseif ($All) {
         if ($installed.Count -eq 0) { Write-DevKitErr 'nothing installed by dev-kit to uninstall'; exit 1 }
         $usel = $installed
     } elseif ($With) {
@@ -1413,7 +2168,9 @@ if ($script:Mirror -eq 'cn') {
 
 # selection
 $selected = @()
-if ($All) {
+if ($script:WizSelected) {
+    $selected = $script:WizSelected
+} elseif ($All) {
     $selected = $script:AllComponents
 } elseif ($With) {
     $flat = @()

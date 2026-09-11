@@ -2,9 +2,9 @@
 #
 # dev-kit — one-shot developer environment installer for macOS and Linux.
 #
-#   curl -fsSL https://raw.githubusercontent.com/zzhtl/dev-kit/main/install.sh | bash -s -- --all
-#   ./install.sh                      # interactive menu
-#   ./install.sh --with go,node --yes
+#   curl -fsSL https://raw.githubusercontent.com/zzhtl/dev-kit/main/install.sh | bash
+#   ./install.sh                      # arrow-key menu: install / uninstall, options and all
+#   ./install.sh --with go,node --yes # ... or drive the whole thing from flags
 #
 # Re-running updates every selected tool to the latest release and removes the
 # versions it supersedes. Language toolchains live under $HOME; sudo is used only
@@ -31,7 +31,25 @@ DK_NODE_VERSION=""
 DK_MIRROR_ARG="auto"
 DK_NO_SHELL_INIT=0
 DK_MODE="install"
+DK_MODE_FORCED=0
 DK_KEEP_CACHE=0
+DK_CONFIRMED=0
+DK_LANG_ARG=""
+DK_NO_TUI=0
+
+# ---- interactive UI state --------------------------------------------------
+DK_LANG="en"
+DK_UTF8=0
+DK_UI_ON=0
+DK_UI_STTY=""
+DK_UI_LINES=0
+DK_UI_COLS=80
+DK_UI_NOTES=""
+DK_UI_RESULT=""
+DK_UI_CUR=">"
+DK_UI_GO="> "
+DK_UI_BACK="< "
+DK_UI_DOT="*"
 
 # ---- resolved runtime state ------------------------------------------------
 DK_OS=""
@@ -70,6 +88,11 @@ dev-kit $DEVKIT_VERSION — install/update a developer toolchain
 
 Usage: install.sh [options]
 
+With no selection and a terminal attached you get an interactive menu: pick
+install or uninstall, tick the components with the arrow keys and space, and
+review every option (versions, mirrors, shell init) before it runs. Every one
+of those choices also has a flag, so scripts never need the menu.
+
 Selection:
   --all                     install every component
   --with a,b,c              install these (of: $DK_COMPONENTS_ALL)
@@ -92,6 +115,8 @@ Uninstall:
 Other:
   --mirror auto|cn|off      package mirrors; auto probes network (default auto)
   --no-shell-init           do not touch shell rc files
+  --lang zh|en              menu language (default: from \$LANG; \$DEVKIT_LANG works too)
+  --no-tui                  plain numbered menu instead of the arrow-key one
   --version                 print version
   --help                    this help
 
@@ -104,6 +129,21 @@ EOF
 }
 
 dk_comp_desc() {
+  if [ "$DK_LANG" = zh ]; then
+    case "$1" in
+      git)    echo "Git";;
+      jdk)    echo "JDK（Temurin，经 SDKMAN）";;
+      maven)  echo "Apache Maven";;
+      gradle) echo "Gradle";;
+      go)     echo "Go";;
+      rust)   echo "Rust（rustup）";;
+      node)   echo "Node.js（经 fnm）";;
+      pnpm)   echo "pnpm";;
+      bun)    echo "Bun";;
+      *)      echo "";;
+    esac
+    return 0
+  fi
   case "$1" in
     git)    echo "Git";;
     jdk)    echo "JDK (Temurin, via SDKMAN)";;
@@ -313,7 +353,16 @@ dk_setup_dirs() {
   PNPM_HOME="${PNPM_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/pnpm}"
   mkdir -p "$DK_CONFIG_DIR" "$DK_DATA_DIR/bin"
   DK_TMP=$(mktemp -d 2>/dev/null || mktemp -d -t devkit)
-  trap 'rm -rf "$DK_TMP"' EXIT
+  trap 'dk_cleanup' EXIT
+  trap 'dk_cleanup; exit 130' INT
+  trap 'dk_cleanup; exit 143' TERM
+}
+
+# idempotent: runs from the EXIT trap and possibly from a signal before it
+dk_cleanup() {
+  dk_ui_close 2>/dev/null || true
+  [ -n "$DK_TMP" ] && rm -rf "$DK_TMP"
+  return 0
 }
 
 dk_setup_sudo() {
@@ -371,7 +420,10 @@ dk_parse_args() {
       --mirror) shift; DK_MIRROR_ARG="$1";;
       --mirror=*) DK_MIRROR_ARG="${1#*=}";;
       --no-shell-init) DK_NO_SHELL_INIT=1;;
-      --uninstall|--remove) DK_MODE=uninstall;;
+      --lang) shift; DK_LANG_ARG="$1";;
+      --lang=*) DK_LANG_ARG="${1#*=}";;
+      --no-tui) DK_NO_TUI=1;;
+      --uninstall|--remove) DK_MODE=uninstall; DK_MODE_FORCED=1;;
       --keep-cache) DK_KEEP_CACHE=1;;
       --version) echo "dev-kit $DEVKIT_VERSION"; exit 0;;
       --help|-h) usage; exit 0;;
@@ -410,7 +462,7 @@ dk_nth_comp() {
 }
 
 dk_menu() {
-  exec 3<>/dev/tty 2>/dev/null || dk_die "no TTY for the menu; use --all or --with a,b,c"
+  { exec 3<>/dev/tty; } 2>/dev/null || dk_die "no TTY for the menu; use --all or --with a,b,c"
   local sel=" " c title
   if [ "$DK_MODE" = uninstall ]; then
     # start with nothing selected; removal must be an explicit choice
@@ -456,7 +508,7 @@ dk_menu_jdk_majors() {
   local avail def line
   avail=$(dk_available_jdk_majors)
   def=$(dk_default_jdk_majors)
-  exec 3<>/dev/tty 2>/dev/null || { DK_JDK_MAJORS="$def"; return; }
+  { exec 3<>/dev/tty; } 2>/dev/null || { DK_JDK_MAJORS="$def"; return; }
   printf '\n  JDK majors to install (space separated, of: %s)\n  > [%s] ' "$avail" "$def" >&3
   IFS= read -r line <&3 || line=""
   exec 3>&-
@@ -1469,8 +1521,9 @@ dk_uninstall_sdkman_maybe() {
 
 dk_uninstall_confirm() {
   [ "$DK_YES" = 1 ] && return 0
+  [ "$DK_CONFIRMED" = 1 ] && return 0
   local ans
-  exec 3<>/dev/tty 2>/dev/null || dk_die "uninstall needs confirmation; re-run with --yes"
+  { exec 3<>/dev/tty; } 2>/dev/null || dk_die "uninstall needs confirmation; re-run with --yes"
   printf '\n  About to UNINSTALL: %s\n' "$DK_SELECTED" >&3
   if [ "$DK_KEEP_CACHE" = 1 ]; then
     printf '  Removes the toolchains and dev-kit config (caches kept).\n' >&3
@@ -1524,6 +1577,627 @@ dk_uninstall_flow() {
 }
 
 # ---------------------------------------------------------------------------
+# i18n — interactive UI strings only (progress/log output stays English)
+# ---------------------------------------------------------------------------
+dk_detect_lang() {
+  local l
+  case "${DK_LANG_ARG:-${DEVKIT_LANG:-}}" in
+    zh|zh_CN|zh-CN|cn) DK_LANG=zh;;
+    en|en_US|C|POSIX)  DK_LANG=en;;
+    "")
+      l="${LC_ALL:-}"; [ -n "$l" ] || l="${LC_MESSAGES:-}"; [ -n "$l" ] || l="${LANG:-}"
+      case "$l" in zh*|*.zh*|*_zh*) DK_LANG=zh;; *) DK_LANG=en;; esac;;
+    *) DK_LANG=en;;
+  esac
+  case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) DK_UTF8=1;;
+    *) DK_UTF8=0;;
+  esac
+  # explicitly asking for Chinese implies a UTF-8 capable terminal
+  [ "$DK_LANG" = zh ] && [ -n "${DK_LANG_ARG:-${DEVKIT_LANG:-}}" ] && DK_UTF8=1
+  if [ "$DK_UTF8" = 1 ]; then
+    DK_UI_CUR="▸"; DK_UI_GO="▶ "; DK_UI_BACK="← "; DK_UI_DOT="●"
+  else
+    DK_UI_CUR=">"; DK_UI_GO="> "; DK_UI_BACK="< "; DK_UI_DOT="*"
+    # a non-UTF-8 terminal cannot render the Chinese menu at all
+    [ "$DK_LANG" = zh ] && DK_LANG=en
+  fi
+  return 0
+}
+
+dk_t() {
+  local zh="" en=""
+  case "$1" in
+    mode.title)    zh='选择要执行的操作';                        en='what would you like to do?';;
+    mode.install)  zh='安装 / 更新组件';                          en='install / update components';;
+    mode.uninst)   zh='卸载组件';                                 en='uninstall components';;
+    mode.quit)     zh='退出';                                     en='quit';;
+    pick.install)  zh='勾选要安装 / 更新的组件';                  en='select components to install / update';;
+    pick.uninst)   zh='勾选要卸载的组件（* = 已安装）';           en='select components to uninstall (* = installed)';;
+    opts.title)    zh='安装选项';                                 en='install options';;
+    opts.titleu)   zh='卸载选项';                                 en='uninstall options';;
+    hint.chk1)     zh='↑/↓ 移动   空格 勾选   回车 确认';         en='up/down move   space toggle   enter confirm';;
+    hint.chk2)     zh='a 全选   n 全不选   i 反选   q 退出';      en='a all   n none   i invert   q quit';;
+    hint.menu1)    zh='↑/↓ 移动   回车 选择   q 退出';            en='up/down move   enter select   q quit';;
+    hint.input)    zh='输入后回车；留空用默认值';                 en='type and press enter; empty keeps the default';;
+    lbl.jdk)       zh='JDK 主版本';                               en='JDK majors';;
+    lbl.go)        zh='Go 版本';                                  en='Go version';;
+    lbl.rust)      zh='Rust 工具链';                              en='Rust toolchain';;
+    lbl.node)      zh='Node 版本';                                en='Node version';;
+    lbl.mirror)    zh='镜像源';                                   en='mirrors';;
+    lbl.shell)     zh='写入 shell 启动文件';                      en='write shell rc files';;
+    lbl.cache)     zh='保留缓存';                                 en='keep caches';;
+    act.start)     zh='开始安装';                                 en='start install';;
+    act.startu)    zh='开始卸载';                                 en='start uninstall';;
+    act.back)      zh='返回上一步';                               en='back';;
+    val.latest)    zh='最新版';                                   en='latest';;
+    val.lts)       zh='最新 LTS';                                 en='latest LTS';;
+    val.custom)    zh='手动输入…';                                en='enter manually...';;
+    val.default)   zh='默认';                                     en='default';;
+    val.yes)       zh='是';                                       en='yes';;
+    val.no)        zh='否';                                       en='no';;
+    val.auto)      zh='auto — 探测网络后自动选择';                en='auto - probe the network';;
+    val.cn)        zh='cn — 使用国内镜像';                        en='cn - China mirrors';;
+    val.off)       zh='off — 只用官方源';                         en='off - upstream only';;
+    in.go)         zh='Go 版本号，例如 1.27.1';                   en='Go version, e.g. 1.27.1';;
+    in.rust)       zh='Rust 版本号，例如 1.90.0';                 en='Rust version, e.g. 1.90.0';;
+    in.node)       zh='Node 主版本号，例如 24';                   en='Node major, e.g. 24';;
+    sum.install)   zh='即将安装 / 更新：';                        en='about to install / update: ';;
+    sum.uninst)    zh='即将卸载：';                               en='about to uninstall: ';;
+    sum.u1)        zh='将删除工具链、缓存和 dev-kit 自身的配置';   en='removes the toolchains, their caches and dev-kit config';;
+    sum.u1k)       zh='将删除工具链和 dev-kit 自身的配置（保留缓存）'; en='removes the toolchains and dev-kit config (caches kept)';;
+    sum.u2)        zh='你自己写的配置文件不会被删除';             en='your own config files are kept';;
+    sum.ask)       zh='确认执行？';                               en='proceed?';;
+    msg.cancel)    zh='已取消';                                   en='cancelled';;
+    msg.none)      zh='没有勾选任何组件';                         en='nothing selected';;
+    msg.noinst)    zh='当前没有由 dev-kit 安装的组件';            en='nothing installed by dev-kit';;
+    msg.loading)   zh='正在获取可用版本…';                        en='fetching available versions...';;
+    msg.badver)    zh='格式不对，请重新输入';                     en='invalid version, try again';;
+    *)             zh=''; en="$1";;
+  esac
+  if [ "$DK_LANG" = zh ] && [ -n "$zh" ]; then printf '%s' "$zh"; else printf '%s' "$en"; fi
+}
+
+# ---------------------------------------------------------------------------
+# terminal UI primitives (arrow keys + checkboxes), bash 3.2 compatible
+#
+# Everything is drawn on fd 3 (/dev/tty) so it still works under
+# `curl ... | bash`, where stdin is the script itself.
+# ---------------------------------------------------------------------------
+dk_ui_supported() {
+  [ "${DEVKIT_NO_TUI:-0}" = 1 ] && return 1
+  [ "$DK_NO_TUI" = 1 ] && return 1
+  case "${TERM:-}" in dumb|"") return 1;; esac
+  [ -e /dev/tty ] || return 1
+  command -v stty >/dev/null 2>&1 || return 1
+  ( exec 9<>/dev/tty ) 2>/dev/null || return 1
+  return 0
+}
+
+dk_ui_open() {
+  [ "$DK_UI_ON" = 1 ] && return 0
+  { exec 3<>/dev/tty; } 2>/dev/null || return 1
+  DK_UI_STTY=$(stty -g <&3 2>/dev/null) || { exec 3>&-; return 1; }
+  if ! stty -icanon -echo min 1 time 0 <&3 2>/dev/null; then
+    exec 3>&-; return 1
+  fi
+  DK_UI_ON=1
+  DK_UI_LINES=0
+  DK_UI_COLS=$(stty size <&3 2>/dev/null | awk '{print $2}') || DK_UI_COLS=""
+  # 0 means "the terminal did not say"; only a genuinely narrow one is a problem
+  case "$DK_UI_COLS" in ''|0|*[!0-9]*) DK_UI_COLS=80;; esac
+  if [ "$DK_UI_COLS" -lt 44 ]; then dk_ui_close; return 1; fi
+  printf '\033[?25l' >&3
+  return 0
+}
+
+dk_ui_close() {
+  [ "$DK_UI_ON" = 1 ] || return 0
+  DK_UI_ON=0
+  printf '\033[?25h' >&3 2>/dev/null || true
+  if [ -n "$DK_UI_STTY" ]; then stty "$DK_UI_STTY" <&3 2>/dev/null || true; fi
+  exec 3>&- || true
+  return 0
+}
+
+# draw one line of the current frame (clearing whatever was there before)
+dk_ui_line() {
+  printf '%s\033[K\n' "$1" >&3
+  DK_UI_LINES=$((DK_UI_LINES + 1))
+}
+
+# put the cursor back at the top of the frame so the next one overdraws it
+dk_ui_rewind() {
+  if [ "$DK_UI_LINES" -gt 0 ]; then printf '\033[%dA' "$DK_UI_LINES" >&3; fi
+  DK_UI_LINES=0
+}
+
+# leave the widget: wipe its frame so the next one starts on a clean screen
+dk_ui_wipe() {
+  dk_ui_rewind
+  printf '\033[J' >&3
+}
+
+dk_ui_header() {
+  local l
+  dk_ui_line ""
+  dk_ui_line "  ${C_BLU}dev-kit${C_RST} ${C_DIM}$DEVKIT_VERSION${C_RST}  $1"
+  dk_ui_line ""
+  if [ -n "$DK_UI_NOTES" ]; then
+    while IFS= read -r l; do dk_ui_line "$l"; done <<EOF
+$DK_UI_NOTES
+EOF
+    dk_ui_line ""
+  fi
+}
+
+dk_ui_footer() {
+  dk_ui_line ""
+  dk_ui_line "  ${C_DIM}$1${C_RST}"
+  [ -n "${2:-}" ] && dk_ui_line "  ${C_DIM}$2${C_RST}"
+  return 0
+}
+
+# read one keypress, print a symbolic name for it
+dk_ui_key() {
+  local k rest
+  IFS= read -rsn1 k <&3 2>/dev/null || { printf 'quit'; return 0; }
+  case "$k" in
+    '')       printf 'enter'; return 0;;
+    ' ')      printf 'space'; return 0;;
+    $'\033')
+      rest=''
+      IFS= read -rsn2 -t 1 rest <&3 2>/dev/null || rest=''
+      case "$rest" in
+        '[A') printf 'up';;
+        '[B') printf 'down';;
+        '[C'|'[D') printf 'other';;
+        '')   printf 'quit';;
+        *)    printf 'other';;
+      esac
+      return 0;;
+    $'\r'|$'\n') printf 'enter';;
+    $'\003')  printf 'quit';;
+    [0-9])    printf 'digit:%s' "$k";;
+    k|K)      printf 'up';;
+    j|J)      printf 'down';;
+    a|A)      printf 'all';;
+    n|N)      printf 'none';;
+    i|I)      printf 'invert';;
+    q|Q)      printf 'quit';;
+    *)        printf 'other';;
+  esac
+}
+
+dk_ui_nth() {
+  local i=1 x
+  for x in $2; do
+    [ "$i" = "$1" ] && { printf '%s' "$x"; return 0; }
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# dk_ui_checklist TITLE ITEMS PRESELECTED LABEL_FN [MARK_FN]
+#   result in DK_UI_RESULT; returns 1 when the user backs out
+dk_ui_checklist() {
+  local title=$1 items=$2 label_fn=$4 mark_fn=${5:-}
+  local sel=" $3 " n=0 cur=0 first=1 i c key mark im ptr row
+  for c in $items; do n=$((n + 1)); done
+  if [ "$n" = 0 ]; then DK_UI_RESULT=""; return 0; fi
+  while :; do
+    if [ "$first" = 1 ]; then first=0; else dk_ui_rewind; fi
+    dk_ui_header "$title"
+    i=0
+    for c in $items; do
+      mark=" "; case "$sel" in *" $c "*) mark="x";; esac
+      im="  "
+      if [ -n "$mark_fn" ]; then im="$("$mark_fn" "$c")"; fi
+      if [ "$i" = "$cur" ]; then ptr="$DK_UI_CUR"; else ptr=" "; fi
+      row=$(printf '  %s [%s] %-7s %s%s' "$ptr" "$mark" "$c" "$im" "$("$label_fn" "$c")")
+      if [ "$i" = "$cur" ]; then
+        dk_ui_line "${C_GRN}${row}${C_RST}"
+      else
+        dk_ui_line "$row"
+      fi
+      i=$((i + 1))
+    done
+    dk_ui_footer "$(dk_t hint.chk1)" "$(dk_t hint.chk2)"
+    key=$(dk_ui_key)
+    case "$key" in
+      up)    cur=$((cur - 1)); [ "$cur" -lt 0 ] && cur=$((n - 1));;
+      down)  cur=$((cur + 1)); [ "$cur" -ge "$n" ] && cur=0;;
+      space) c=$(dk_ui_nth $((cur + 1)) "$items"); sel=$(dk_ui_toggle "$sel" "$c");;
+      digit:*)
+        c=$(dk_ui_nth "${key#digit:}" "$items" 2>/dev/null || true)
+        if [ -n "$c" ]; then sel=$(dk_ui_toggle "$sel" "$c"); fi;;
+      all)   sel=" $items ";;
+      none)  sel=" ";;
+      invert)
+        local inv=" "
+        for c in $items; do
+          case "$sel" in *" $c "*) ;; *) inv="$inv$c ";; esac
+        done
+        sel="$inv";;
+      enter) break;;
+      quit)  dk_ui_wipe; return 1;;
+      *)     ;;
+    esac
+  done
+  dk_ui_wipe
+  DK_UI_RESULT=""
+  for c in $items; do
+    case "$sel" in *" $c "*) DK_UI_RESULT="$DK_UI_RESULT $c";; esac
+  done
+  DK_UI_RESULT=$(printf '%s' "$DK_UI_RESULT" | sed 's/^ *//')
+  return 0
+}
+
+dk_ui_toggle() {
+  case "$1" in
+    *" $2 "*) printf '%s' "$1" | sed "s/ $2 / /";;
+    *)        printf '%s%s ' "$1" "$2";;
+  esac
+}
+
+# dk_ui_menu TITLE ITEMS MARKED CURSOR LABEL_FN
+#   single choice; MARKED gets a dot, CURSOR is where the pointer starts.
+#   result in DK_UI_RESULT; returns 1 when the user backs out
+dk_ui_menu() {
+  local title=$1 items=$2 marked=$3 want=$4 label_fn=$5
+  local n=0 cur=0 first=1 i c key ptr dot row
+  for c in $items; do
+    [ "$c" = "$want" ] && cur=$n
+    n=$((n + 1))
+  done
+  if [ "$n" = 0 ]; then DK_UI_RESULT=""; return 1; fi
+  while :; do
+    if [ "$first" = 1 ]; then first=0; else dk_ui_rewind; fi
+    dk_ui_header "$title"
+    i=0
+    for c in $items; do
+      if [ "$i" = "$cur" ]; then ptr="$DK_UI_CUR"; else ptr=" "; fi
+      if [ -n "$marked" ] && [ "$c" = "$marked" ]; then dot="$DK_UI_DOT"; else dot=" "; fi
+      row=$(printf '  %s %s %s' "$ptr" "$dot" "$("$label_fn" "$c")")
+      if [ "$i" = "$cur" ]; then
+        dk_ui_line "${C_GRN}${row}${C_RST}"
+      else
+        dk_ui_line "$row"
+      fi
+      i=$((i + 1))
+    done
+    dk_ui_footer "$(dk_t hint.menu1)"
+    key=$(dk_ui_key)
+    case "$key" in
+      up)    cur=$((cur - 1)); [ "$cur" -lt 0 ] && cur=$((n - 1));;
+      down)  cur=$((cur + 1)); [ "$cur" -ge "$n" ] && cur=0;;
+      digit:*)
+        c=$(dk_ui_nth "${key#digit:}" "$items" 2>/dev/null || true)
+        if [ -n "$c" ]; then cur=$(( ${key#digit:} - 1 )); fi;;
+      enter|space) break;;
+      quit)  dk_ui_wipe; return 1;;
+      *)     ;;
+    esac
+  done
+  dk_ui_wipe
+  DK_UI_RESULT=$(dk_ui_nth $((cur + 1)) "$items")
+  return 0
+}
+
+# dk_ui_input TITLE DEFAULT -> DK_UI_RESULT (empty means "keep the default")
+dk_ui_input() {
+  local line=""
+  dk_ui_header "$1"
+  if [ -n "$2" ]; then
+    dk_ui_line "  ${C_DIM}$(dk_t val.default): $2${C_RST}"
+  fi
+  dk_ui_footer "$(dk_t hint.input)"
+  dk_ui_line ""
+  # hand the terminal back to cooked mode for the duration of the read
+  if [ -n "$DK_UI_STTY" ]; then stty "$DK_UI_STTY" <&3 2>/dev/null || true; fi
+  printf '\033[?25h  > ' >&3
+  IFS= read -r line <&3 2>/dev/null || line=""
+  printf '\033[?25l' >&3
+  stty -icanon -echo min 1 time 0 <&3 2>/dev/null || true
+  DK_UI_LINES=$((DK_UI_LINES + 1))
+  dk_ui_wipe
+  DK_UI_RESULT=$(printf '%s' "$line" | tr -d '\r' | sed 's/^ *//; s/ *$//')
+  return 0
+}
+
+# dk_ui_yesno TITLE CURRENT(0|1) -> 0 = yes, 1 = no, 2 = backed out
+dk_ui_yesno() {
+  local want=no
+  [ "$2" = 1 ] && want=yes
+  dk_ui_menu "$1" "yes no" "$want" "$want" dk_ui_yesno_label || return 2
+  [ "$DK_UI_RESULT" = yes ] && return 0
+  return 1
+}
+dk_ui_yesno_label() {
+  case "$1" in
+    yes) dk_t val.yes;;
+    *)   dk_t val.no;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# interactive wizard: mode -> components -> options -> run
+# ---------------------------------------------------------------------------
+dk_wizard_wanted() {
+  [ "$DK_ALL" = 1 ] && return 1
+  [ -n "$DK_WITH" ] && return 1
+  [ "$DK_YES" = 1 ] && return 1
+  dk_ui_supported || return 1
+  return 0
+}
+
+dk_wiz_mode_label() {
+  case "$1" in
+    install)   dk_t mode.install;;
+    uninstall) dk_t mode.uninst;;
+    *)         dk_t mode.quit;;
+  esac
+}
+
+dk_wiz_inst_mark() {
+  if dk_detect_installed "$1"; then printf '%s' "* "; else printf '%s' "  "; fi
+}
+
+dk_wiz_pick() {
+  local c installed="" title
+  installed=""
+  for c in $DK_COMPONENTS_ALL; do dk_detect_installed "$c" && installed="$installed$c "; done
+  # coming back from a later step: keep what was ticked, do not reset it
+  if [ "$DK_MODE" = uninstall ]; then
+    [ -n "$installed" ] || { dk_ui_close; dk_die "$(dk_t msg.noinst)"; }
+    title=$(dk_t pick.uninst)
+    while :; do
+      dk_ui_checklist "$title" "$DK_COMPONENTS_ALL" "$DK_SELECTED" dk_comp_desc dk_wiz_inst_mark || return 1
+      [ -n "$DK_UI_RESULT" ] && break
+      title="$(dk_t pick.uninst)   ${C_YEL}$(dk_t msg.none)${C_RST}"
+    done
+  else
+    [ -n "$DK_SELECTED" ] && installed="$DK_SELECTED"
+    title=$(dk_t pick.install)
+    while :; do
+      dk_ui_checklist "$title" "$DK_COMPONENTS_ALL" "$installed" dk_comp_desc || return 1
+      [ -n "$DK_UI_RESULT" ] && break
+      title="$(dk_t pick.install)   ${C_YEL}$(dk_t msg.none)${C_RST}"
+    done
+  fi
+  DK_SELECTED="$DK_UI_RESULT"
+
+  # maven/gradle need a JDK
+  if [ "$DK_MODE" = install ] && dk_selected_any maven gradle && ! dk_selected jdk; then
+    if ! command -v java >/dev/null 2>&1 && [ ! -d "$SDKMAN_DIR/candidates/java/current" ]; then
+      dk_info "maven/gradle need a JDK; adding jdk to the selection"
+      DK_SELECTED="$DK_SELECTED jdk"
+    fi
+  fi
+  if [ "$DK_MODE" = install ] && dk_selected jdk && [ -z "$DK_JDK_MAJORS" ]; then
+    if [ -n "$DK_JDK_VERSION" ]; then
+      DK_JDK_MAJORS=$(printf '%s' "$DK_JDK_VERSION" | tr ',' ' ')
+    else
+      dk_ui_line "  ${C_DIM}$(dk_t msg.loading)${C_RST}"
+      DK_JDK_MAJORS=$(dk_default_jdk_majors)
+      dk_ui_wipe
+    fi
+  fi
+  return 0
+}
+
+dk_wiz_option_items() {
+  local items=""
+  if [ "$DK_MODE" = uninstall ]; then
+    printf 'cache startu back'
+    return 0
+  fi
+  dk_selected jdk  && items="$items jdk"
+  dk_selected go   && items="$items go"
+  dk_selected rust && items="$items rust"
+  dk_selected node && items="$items node"
+  items="$items mirror shell start back"
+  printf '%s' "$items" | sed 's/^ *//'
+}
+
+dk_wiz_yesno_text() {
+  if [ "$1" = 1 ]; then dk_t val.yes; else dk_t val.no; fi
+}
+
+dk_wiz_opt_label() {
+  case "$1" in
+    jdk)    printf '%s: %s' "$(dk_t lbl.jdk)"    "$DK_JDK_MAJORS";;
+    go)     printf '%s: %s' "$(dk_t lbl.go)"     "${DK_GO_VERSION:-$(dk_t val.latest)}";;
+    rust)   printf '%s: %s' "$(dk_t lbl.rust)"   "${DK_RUST_VERSION:-stable}";;
+    node)   printf '%s: %s' "$(dk_t lbl.node)"   "${DK_NODE_VERSION:-$(dk_t val.lts)}";;
+    mirror) printf '%s: %s' "$(dk_t lbl.mirror)" "$DK_MIRROR_ARG";;
+    shell)  printf '%s: %s' "$(dk_t lbl.shell)"  "$(dk_wiz_yesno_text $((1 - DK_NO_SHELL_INIT)))";;
+    cache)  printf '%s: %s' "$(dk_t lbl.cache)"  "$(dk_wiz_yesno_text "$DK_KEEP_CACHE")";;
+    start)  printf '%s%s' "$DK_UI_GO"   "$(dk_t act.start)";;
+    startu) printf '%s%s' "$DK_UI_GO"   "$(dk_t act.startu)";;
+    back)   printf '%s%s' "$DK_UI_BACK" "$(dk_t act.back)";;
+    *)      printf '%s' "$1";;
+  esac
+}
+
+dk_wiz_choice_label() {
+  case "$1" in
+    latest) dk_t val.latest;;
+    lts)    dk_t val.lts;;
+    custom) dk_t val.custom;;
+    auto)   dk_t val.auto;;
+    cn)     dk_t val.cn;;
+    off)    dk_t val.off;;
+    *)      printf '%s' "$1";;
+  esac
+}
+dk_wiz_jdk_label() { printf ''; }
+
+# dk_wiz_ask_version PROMPT_KEY CURRENT VALIDATOR -> DK_UI_RESULT ('' = unchanged)
+dk_wiz_ask_version() {
+  local title cur=$2 v
+  title=$(dk_t "$1")
+  while :; do
+    dk_ui_input "$title" "$cur"
+    v=$DK_UI_RESULT
+    [ -z "$v" ] && { DK_UI_RESULT=""; return 0; }
+    if "$3" "$v"; then DK_UI_RESULT="$v"; return 0; fi
+    title="$(dk_t "$1")   ${C_YEL}$(dk_t msg.badver)${C_RST}"
+  done
+}
+dk_is_major() { printf '%s' "$1" | grep -qE '^[0-9]+$'; }
+
+dk_wiz_edit_go() {
+  local marked=latest
+  [ -n "$DK_GO_VERSION" ] && marked=custom
+  dk_ui_menu "$(dk_t lbl.go)" "latest custom" "$marked" "$marked" dk_wiz_choice_label || return 0
+  case "$DK_UI_RESULT" in
+    latest) DK_GO_VERSION="";;
+    custom) dk_wiz_ask_version in.go "$DK_GO_VERSION" dk_is_semver
+            [ -n "$DK_UI_RESULT" ] && DK_GO_VERSION="$DK_UI_RESULT";;
+  esac
+  return 0
+}
+
+dk_wiz_edit_rust() {
+  local marked=stable
+  case "${DK_RUST_VERSION:-stable}" in
+    stable|beta|nightly) marked="${DK_RUST_VERSION:-stable}";;
+    *) marked=custom;;
+  esac
+  dk_ui_menu "$(dk_t lbl.rust)" "stable beta nightly custom" "$marked" "$marked" dk_wiz_choice_label || return 0
+  case "$DK_UI_RESULT" in
+    custom) dk_wiz_ask_version in.rust "$DK_RUST_VERSION" dk_is_semver
+            [ -n "$DK_UI_RESULT" ] && DK_RUST_VERSION="$DK_UI_RESULT";;
+    stable) DK_RUST_VERSION="";;
+    *)      DK_RUST_VERSION="$DK_UI_RESULT";;
+  esac
+  return 0
+}
+
+dk_wiz_edit_node() {
+  local marked=lts
+  case "${DK_NODE_VERSION:-lts}" in lts) marked=lts;; *) marked=custom;; esac
+  dk_ui_menu "$(dk_t lbl.node)" "lts custom" "$marked" "$marked" dk_wiz_choice_label || return 0
+  case "$DK_UI_RESULT" in
+    lts)    DK_NODE_VERSION="";;
+    custom) dk_wiz_ask_version in.node "$DK_NODE_VERSION" dk_is_major
+            [ -n "$DK_UI_RESULT" ] && DK_NODE_VERSION="$DK_UI_RESULT";;
+  esac
+  return 0
+}
+
+dk_wiz_edit_mirror() {
+  dk_ui_menu "$(dk_t lbl.mirror)" "auto cn off" "$DK_MIRROR_ARG" "$DK_MIRROR_ARG" dk_wiz_choice_label || return 0
+  DK_MIRROR_ARG="$DK_UI_RESULT"
+  return 0
+}
+
+dk_wiz_edit_jdk() {
+  local avail
+  dk_ui_line "  ${C_DIM}$(dk_t msg.loading)${C_RST}"
+  avail=$(dk_available_jdk_majors)
+  dk_ui_wipe
+  dk_ui_checklist "$(dk_t lbl.jdk)" "$avail" "$DK_JDK_MAJORS" dk_wiz_jdk_label || return 0
+  [ -n "$DK_UI_RESULT" ] && DK_JDK_MAJORS="$DK_UI_RESULT"
+  return 0
+}
+
+dk_wiz_summary_note() {
+  if [ "$DK_MODE" = uninstall ]; then
+    printf '  %s%s' "$(dk_t sum.uninst)" "$DK_SELECTED"
+  else
+    printf '  %s%s' "$(dk_t sum.install)" "$DK_SELECTED"
+  fi
+}
+
+# 0 = start, 2 = back to the component picker
+dk_wiz_options() {
+  local items cur=start rc
+  [ "$DK_MODE" = uninstall ] && cur=startu
+  while :; do
+    items=$(dk_wiz_option_items)
+    DK_UI_NOTES=$(dk_wiz_summary_note)
+    rc=0
+    if [ "$DK_MODE" = uninstall ]; then
+      dk_ui_menu "$(dk_t opts.titleu)" "$items" "" "$cur" dk_wiz_opt_label || rc=$?
+    else
+      dk_ui_menu "$(dk_t opts.title)" "$items" "" "$cur" dk_wiz_opt_label || rc=$?
+    fi
+    DK_UI_NOTES=""
+    [ "$rc" = 0 ] || return 2
+    cur=$DK_UI_RESULT
+    case "$DK_UI_RESULT" in
+      start|startu) return 0;;
+      back)   return 2;;
+      jdk)    dk_wiz_edit_jdk;;
+      go)     dk_wiz_edit_go;;
+      rust)   dk_wiz_edit_rust;;
+      node)   dk_wiz_edit_node;;
+      mirror) dk_wiz_edit_mirror;;
+      shell)  rc=0; dk_ui_yesno "$(dk_t lbl.shell)" $((1 - DK_NO_SHELL_INIT)) || rc=$?
+              if   [ "$rc" = 0 ]; then DK_NO_SHELL_INIT=0
+              elif [ "$rc" = 1 ]; then DK_NO_SHELL_INIT=1; fi;;
+      cache)  rc=0; dk_ui_yesno "$(dk_t lbl.cache)" "$DK_KEEP_CACHE" || rc=$?
+              if   [ "$rc" = 0 ]; then DK_KEEP_CACHE=1
+              elif [ "$rc" = 1 ]; then DK_KEEP_CACHE=0; fi;;
+    esac
+  done
+}
+
+# last stop before deleting things; 0 = go ahead, 1 = back to the options
+dk_wiz_confirm_uninstall() {
+  local rc=0 note
+  if [ "$DK_KEEP_CACHE" = 1 ]; then note=$(dk_t sum.u1k); else note=$(dk_t sum.u1); fi
+  DK_UI_NOTES=$(printf '  %s%s\n  %s%s%s\n  %s' \
+    "$(dk_t sum.uninst)" "$DK_SELECTED" "$C_YEL" "$note" "$C_RST" "$(dk_t sum.u2)")
+  dk_ui_yesno "$(dk_t sum.ask)" 0 || rc=$?
+  DK_UI_NOTES=""
+  [ "$rc" = 0 ] && return 0
+  return 1
+}
+
+dk_wizard() {
+  local step=1 rc
+  dk_ui_open || return 1
+  [ "$DK_MODE_FORCED" = 1 ] && step=2
+  while :; do
+    case "$step" in
+      1)
+        rc=0
+        dk_ui_menu "$(dk_t mode.title)" "install uninstall quit" "" install dk_wiz_mode_label || rc=$?
+        if [ "$rc" != 0 ]; then dk_ui_close; dk_info "$(dk_t msg.cancel)"; exit 0; fi
+        case "$DK_UI_RESULT" in
+          install)   DK_MODE=install;   step=2;;
+          uninstall) DK_MODE=uninstall; step=2;;
+          *)         dk_ui_close; exit 0;;
+        esac;;
+      2)
+        rc=0; dk_wiz_pick || rc=$?
+        if [ "$rc" != 0 ]; then
+          if [ "$DK_MODE_FORCED" = 1 ]; then dk_ui_close; dk_info "$(dk_t msg.cancel)"; exit 0; fi
+          step=1; continue
+        fi
+        step=3;;
+      3)
+        rc=0; dk_wiz_options || rc=$?
+        if [ "$rc" != 0 ]; then step=2; continue; fi
+        if [ "$DK_MODE" = uninstall ]; then step=4; else break; fi;;
+      4)
+        rc=0; dk_wiz_confirm_uninstall || rc=$?
+        if [ "$rc" != 0 ]; then step=3; continue; fi
+        break;;
+    esac
+  done
+  dk_ui_close
+  DK_CONFIRMED=1
+  if dk_selected jdk && [ -n "$DK_JDK_MAJORS" ]; then
+    DK_JDK_DEFAULT=$(printf '%s' "$DK_JDK_MAJORS" | awk '{print $1}')
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # orchestration
 # ---------------------------------------------------------------------------
 dk_run_component() {
@@ -1543,10 +2217,11 @@ dk_run_component() {
 
 main() {
   dk_parse_args "$@"
+  dk_detect_lang
   dk_detect_platform
   dk_setup_dirs
   dk_setup_sudo
-  dk_resolve_selection
+  if dk_wizard_wanted && dk_wizard; then :; else dk_resolve_selection; fi
 
   if [ "$DK_MODE" = uninstall ]; then
     DK_MIRROR=$(dk_state_get mirror); [ -n "$DK_MIRROR" ] || DK_MIRROR=off

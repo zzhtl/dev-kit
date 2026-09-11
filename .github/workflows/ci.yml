@@ -16,6 +16,16 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           bash -n install.sh
           shellcheck -s bash -S warning install.sh tests/incontainer.sh tests/docker-matrix.sh
+      - name: install.ps1 stays ASCII outside comments
+        # It ships without a BOM (a BOM breaks `irm ... | iex`), so Windows
+        # PowerShell 5.1 reads it with the ANSI code page: any non-ASCII in code
+        # would be mangled. UI strings must use \uXXXX escapes instead.
+        run: |
+          if grep -nP '[^\x00-\x7F]' install.ps1 | grep -vP ':\s*#'; then
+            echo "non-ASCII outside a comment in install.ps1 (use \uXXXX escapes)"
+            exit 1
+          fi
+
       - name: PowerShell parse + PSScriptAnalyzer
         run: |
           docker run --rm -v "$PWD:/src:ro" mcr.microsoft.com/powershell:ubuntu-24.04 pwsh -NoProfile -c '

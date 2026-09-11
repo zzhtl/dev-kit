@@ -179,14 +179,21 @@ function Get-DevKitState {
     }
     return (New-Object PSObject)
 }
+# `$State.PSObject.Properties.Name` is member enumeration over the property
+# collection. On a fresh machine the state object has no properties at all, and
+# enumerating a member off an empty collection throws under Set-StrictMode 2.0
+# ("The property 'Name' cannot be found on this object") -- which killed the
+# very first state read. The indexer returns $null for a missing name instead.
 function Get-DevKitStateValue {
     param($State, [string]$Name)
-    if ($State -and (@($State.PSObject.Properties.Name) -contains $Name)) { return $State.$Name }
-    return $null
+    if ($null -eq $State) { return $null }
+    $prop = $State.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $null }
+    return $prop.Value
 }
 function Set-DevKitStateValue {
     param($State, [string]$Name, $Value)
-    if (@($State.PSObject.Properties.Name) -contains $Name) { $State.$Name = $Value }
+    if ($null -ne $State.PSObject.Properties[$Name]) { $State.$Name = $Value }
     else { $State | Add-Member -NotePropertyName $Name -NotePropertyValue $Value }
 }
 function Save-DevKitState {

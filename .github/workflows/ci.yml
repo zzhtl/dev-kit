@@ -69,16 +69,8 @@ jobs:
       - name: install (unix)
         if: runner.os != 'Windows'
         run: |
-          bash install.sh --all --yes --mirror off 2>&1 | tee "$RUNNER_TEMP/dk.log"
+          bash install.sh --all --yes --mirror off 2>&1 | tee "$RUNNER_TEMP/dk-install.log"
           exit ${PIPESTATUS[0]}
-      # TEMPORARY (diagnostics): job logs need admin rights to download, annotations do not
-      - name: surface the failure (unix)
-        if: failure() && runner.os != 'Windows'
-        run: |
-          m=$( { grep -nE 'err |failed at line|failed:' "$RUNNER_TEMP/dk.log" | tail -15
-                 echo '---- tail ----'
-                 tail -25 "$RUNNER_TEMP/dk.log"; } | sed 's/%/%25/g; s/\r//' | awk '{printf "%s%%0A", $0}' )
-          echo "::error title=dk-unix::$m"
       - name: verify (unix)
         if: runner.os != 'Windows'
         run: |
@@ -97,10 +89,12 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -e
-          h1=$(sha256sum "$HOME/.config/dev-kit/env.sh" | cut -d' ' -f1)
-          bash install.sh --all --yes --mirror off
-          h2=$(sha256sum "$HOME/.config/dev-kit/env.sh" | cut -d' ' -f1)
-          test "$h1" = "$h2" || { echo "env.sh changed on re-run"; exit 1; }
+          env_sh="$HOME/.config/dev-kit/env.sh"
+          cp "$env_sh" "$RUNNER_TEMP/env.sh.before"
+          bash install.sh --all --yes --mirror off 2>&1 | tee "$RUNNER_TEMP/dk-rerun.log"
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || exit "$rc"
+          diff -u "$RUNNER_TEMP/env.sh.before" "$env_sh" > "$RUNNER_TEMP/dk-envdiff.log" \
+            || { echo "env.sh changed on re-run"; cat "$RUNNER_TEMP/dk-envdiff.log"; exit 1; }
       - name: uninstall (unix)
         if: runner.os != 'Windows'
         run: |
@@ -127,19 +121,6 @@ jobs:
             exit 1
           }
           Stop-Transcript | Out-Null
-      # TEMPORARY (diagnostics): job logs need admin rights to download, annotations do not
-      - name: surface the failure (windows)
-        if: failure() && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $log = Join-Path $env:RUNNER_TEMP 'dk.log'
-          if (Test-Path $log) {
-            $hits = @(Select-String -Path $log -Pattern '\[error\]|EXCEPTION' |
-                      Select-Object -Last 10 | ForEach-Object { $_.Line })
-            $lines = $hits + @('---- tail ----') + @(Get-Content $log -Tail 25)
-            $t = ($lines | ForEach-Object { $_ -replace '%', '%25' }) -join '%0A'
-          } else { $t = '(no log written)' }
-          Write-Host "::error title=dk-win::$t"
       - name: verify (windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -169,3 +150,28 @@ jobs:
         run: |
           & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -Uninstall -All -Yes
           if (Test-Path "$env:LOCALAPPDATA\dev-kit") { Write-Error "dev-kit dir not removed"; exit 1 }
+
+      # TEMPORARY (diagnostics): job logs need admin rights to download, annotations do not
+      - name: surface the failure (unix)
+        if: failure() && runner.os != 'Windows'
+        run: |
+          for f in "$RUNNER_TEMP"/dk-*.log; do
+            [ -f "$f" ] || continue
+            m=$( { grep -nE 'err |warn |failed at line|failed:' "$f" | tail -12 || true
+                   echo "---- tail of $(basename "$f") ----"
+                   tail -20 "$f"; } | sed 's/%/%25/g; s/\r//' | awk '{printf "%s%%0A", $0}' )
+            echo "::error title=$(basename "$f")::$m"
+          done
+      # TEMPORARY (diagnostics): job logs need admin rights to download, annotations do not
+      - name: surface the failure (windows)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'dk.log'
+          if (Test-Path $log) {
+            $hits = @(Select-String -Path $log -Pattern '\[error\]|\[warn\]|EXCEPTION' |
+                      Select-Object -Last 14 | ForEach-Object { $_.Line })
+            $lines = $hits + @('---- tail ----') + @(Get-Content $log -Tail 25)
+            $t = ($lines | ForEach-Object { $_ -replace '%', '%25' }) -join '%0A'
+          } else { $t = '(no log written)' }
+          Write-Host "::error title=dk-win::$t"

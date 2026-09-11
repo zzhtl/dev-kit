@@ -541,6 +541,11 @@ function Install-DevKitJdkArchive {
     Expand-DevKitArchive -Path $zip -Dest $ex
     $inner = @(Get-ChildItem -Path $ex -Directory) | Select-Object -First 1
     if (-not $inner) { throw "empty JDK archive for $Major" }
+    # nothing has created the jdk directory yet on a clean machine, and
+    # Move-Item into a missing parent is "Could not find a part of the path"
+    if (-not (Test-Path $script:JdkDir)) {
+        New-Item -ItemType Directory -Force -Path $script:JdkDir | Out-Null
+    }
     $target = Join-Path $script:JdkDir $Major
     $new = "$target.new"
     if (Test-Path $new) { Remove-Item -Recurse -Force $new }

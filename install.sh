@@ -1207,13 +1207,22 @@ dk_bun_target() {
 }
 
 dk_bun_tag() {
+  local t=""
   if [ "$DK_MIRROR" = cn ]; then
-    curl -fsSL -m 20 "https://registry.npmmirror.com/-/binary/bun/" 2>/dev/null \
-      | grep -oE 'bun-v[0-9]+\.[0-9]+\.[0-9]+' | sort -u | dk_ver_max
-  else
-    curl -fsSL -m 20 "https://api.github.com/repos/oven-sh/bun/releases/latest" 2>/dev/null \
-      | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -n '1p' | sed -E 's/.*"([^"]*)"$/\1/'
+    t=$({ curl -fsSL -m 20 "https://registry.npmmirror.com/-/binary/bun/" 2>/dev/null || true; } \
+        | grep -oE 'bun-v[0-9]+\.[0-9]+\.[0-9]+' | sort -u | dk_ver_max)
+    printf '%s' "$t"; return 0
   fi
+  t=$({ curl -fsSL -m 20 "https://api.github.com/repos/oven-sh/bun/releases/latest" 2>/dev/null || true; } \
+      | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -n '1p' | sed -E 's/.*"([^"]*)"$/\1/')
+  # the anonymous API is rate limited per IP and CI runners share theirs; the
+  # /releases/latest redirect carries the same tag and is not rate limited
+  if [ -z "$t" ]; then
+    t=$(curl -fsSLI -o /dev/null -w '%{url_effective}' -m 20 \
+          "https://github.com/oven-sh/bun/releases/latest" 2>/dev/null | sed -E 's#.*/tag/##')
+    case "$t" in bun-v[0-9]*) ;; *) t="";; esac
+  fi
+  printf '%s' "$t"
 }
 
 dk_c_bun() {

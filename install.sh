@@ -624,7 +624,7 @@ dk_install_prereqs() {
 
   if [ "$DK_NO_SUDO" = 1 ]; then
     dk_warn "no sudo available; skipping system packages"
-    dk_require_cmds curl tar unzip zip xz
+    dk_require_cmds curl tar gzip unzip zip xz
     return 0
   fi
 
@@ -633,38 +633,38 @@ dk_install_prereqs() {
     apt)
       $SUDO apt-get update -qq || dk_warn "apt-get update failed (continuing)"
       $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        curl ca-certificates zip unzip tar xz-utils \
+        curl ca-certificates zip unzip tar gzip xz-utils \
         ${want_git:+git} ${want_cc:+build-essential} \
         || dk_warn "apt-get install had errors (continuing)"
       ;;
     dnf|yum)
       $SUDO "$DK_PKG" -y install \
-        curl ca-certificates zip unzip tar xz \
+        curl ca-certificates zip unzip tar gzip xz \
         ${want_git:+git} ${want_cc:+gcc gcc-c++ make} \
         || dk_warn "$DK_PKG install had errors (continuing)"
       ;;
     pacman)
       $SUDO pacman -Sy --needed --noconfirm \
-        curl ca-certificates zip unzip tar xz \
+        curl ca-certificates zip unzip tar gzip xz \
         ${want_git:+git} ${want_cc:+base-devel} \
         || dk_warn "pacman install had errors (continuing)"
       ;;
     zypper)
       $SUDO zypper -n install \
-        curl ca-certificates zip unzip tar xz \
+        curl ca-certificates zip unzip tar gzip xz \
         ${want_git:+git} ${want_cc:+gcc gcc-c++ make} \
         || dk_warn "zypper install had errors (continuing)"
       ;;
     apk)
       # libstdc++/libgcc are runtime deps of the bun (and node) musl builds
       $SUDO apk add --no-cache bash \
-        curl ca-certificates zip unzip tar xz libstdc++ libgcc \
+        curl ca-certificates zip unzip tar gzip xz libstdc++ libgcc \
         ${want_git:+git} ${want_cc:+build-base} \
         || dk_warn "apk install had errors (continuing)"
       ;;
     *)
-      dk_warn "unknown package manager; ensure curl, tar, unzip, zip are installed"
-      dk_require_cmds curl tar unzip zip
+      dk_warn "unknown package manager; ensure curl, tar, gzip, unzip, zip are installed"
+      dk_require_cmds curl tar gzip unzip zip
       ;;
   esac
 }

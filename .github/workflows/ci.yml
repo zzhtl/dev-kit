@@ -99,9 +99,16 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -e
-          bash install.sh --uninstall --all --yes
-          test ! -e "$HOME/.config/dev-kit" || { echo "dev-kit config not removed"; exit 1; }
-          test ! -e "$HOME/.local/share/dev-kit" || { echo "dev-kit data not removed"; exit 1; }
+          bash install.sh --uninstall --all --yes 2>&1 | tee "$RUNNER_TEMP/dk-uninstall.log"
+          rc=${PIPESTATUS[0]}; [ "$rc" = 0 ] || exit "$rc"
+          left=0
+          for d in "$HOME/.config/dev-kit" "$HOME/.local/share/dev-kit"; do
+            if [ -e "$d" ]; then
+              left=1
+              { echo "still present: $d"; find "$d" | head -40; } >> "$RUNNER_TEMP/dk-uninstall.log"
+            fi
+          done
+          [ "$left" = 0 ] || { cat "$RUNNER_TEMP/dk-uninstall.log"; exit 1; }
 
       # ---- Windows PowerShell 5.1 (scriptblock form exercises the irm|iex path) ----
       - name: install (windows, powershell 5.1)

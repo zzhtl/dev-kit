@@ -264,7 +264,7 @@ dk_state_get() {
   local f line; f=$(dk_state_file)
   [ -f "$f" ] || return 0
   # a missing key must yield empty output, not a pipeline failure (pipefail + set -e)
-  line=$(grep -E "^$1=" "$f" 2>/dev/null | tail -1) || true
+  line=$({ grep -E "^$1=" "$f" 2>/dev/null || true; } | tail -1)
   printf '%s' "${line#*=}"
 }
 dk_state_set() {
@@ -279,14 +279,19 @@ dk_state_set() {
 
 # ---- marker-block editing --------------------------------------------------
 dk_upsert_block() {
-  local file=$1 block=$2 begin="# >>> dev-kit >>>" end="# <<< dev-kit <<<"
+  local file=$1 block=$2 begin="# >>> dev-kit >>>" end="# <<< dev-kit <<<" rf
   touch "$file"
   if grep -qF "$begin" "$file"; then
-    awk -v b="$begin" -v e="$end" -v repl="$block" '
-      $0==b {print repl; skip=1; next}
+    # the block is multi-line and BSD awk (macOS) rejects a newline inside -v,
+    # so hand it over as a file rather than as an awk variable
+    rf="${DK_TMP:-${TMPDIR:-/tmp}}/dk-upsert.block"
+    printf '%s\n' "$block" > "$rf"
+    awk -v b="$begin" -v e="$end" -v rf="$rf" '
+      $0==b {while ((getline l < rf) > 0) print l; close(rf); skip=1; next}
       $0==e {skip=0; next}
       skip!=1 {print}
     ' "$file" > "$file.dk.tmp" && mv "$file.dk.tmp" "$file"
+    rm -f "$rf"
   else
     printf '\n%s\n' "$block" >> "$file"
   fi

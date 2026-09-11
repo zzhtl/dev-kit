@@ -114,16 +114,19 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
+          # Start-Transcript, NOT `*>&1`: merging the streams makes PowerShell 5.1
+          # turn any native command's stderr (rustup's "info:" lines, fnm's, tar's)
+          # into a terminating error under $ErrorActionPreference = 'Stop'.
           $log = Join-Path $env:RUNNER_TEMP 'dk.log'
+          Start-Transcript -Path $log | Out-Null
           try {
-            & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -All -Yes -Mirror off *>&1 |
-              ForEach-Object { $s = [string]$_; Write-Host $s; Add-Content -LiteralPath $log -Value $s }
+            & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -All -Yes -Mirror off
           } catch {
-            $m = "EXCEPTION $($_.Exception.GetType().Name): $($_.Exception.Message) @line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line)"
-            Write-Host $m
-            Add-Content -LiteralPath $log -Value $m
+            Write-Host "EXCEPTION $($_.Exception.GetType().Name): $($_.Exception.Message) @line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line)"
+            Stop-Transcript | Out-Null
             exit 1
           }
+          Stop-Transcript | Out-Null
       # TEMPORARY (diagnostics): job logs need admin rights to download, annotations do not
       - name: surface the failure (windows)
         if: failure() && runner.os == 'Windows'
@@ -131,7 +134,10 @@ jobs:
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'dk.log'
           if (Test-Path $log) {
-            $t = ((Get-Content $log -Tail 40) | ForEach-Object { $_ -replace '%', '%25' }) -join '%0A'
+            $hits = @(Select-String -Path $log -Pattern '\[error\]|EXCEPTION' |
+                      Select-Object -Last 10 | ForEach-Object { $_.Line })
+            $lines = $hits + @('---- tail ----') + @(Get-Content $log -Tail 25)
+            $t = ($lines | ForEach-Object { $_ -replace '%', '%25' }) -join '%0A'
           } else { $t = '(no log written)' }
           Write-Host "::error title=dk-win::$t"
       - name: verify (windows)

@@ -198,6 +198,9 @@ Use-Jdk 25 -Persist           # set the default for new sessions too
 ## Notes
 
 - Bash script targets the bash that ships on a stock machine (including macOS `bash 3.2`).
+- Installing `jdk` / `maven` / `gradle` on macOS needs bash >= 4 (SDKMAN 5.23 requires it, macOS
+  ships 3.2). With Homebrew present dev-kit runs `brew install bash` and uses that bash for
+  SDKMAN only — your login shell is left alone.
 - Windows script runs on Windows PowerShell **5.1** and PowerShell 7. If a profile does not load,
   it prints the `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` hint.
 - Rust on Windows needs the MSVC C++ Build Tools for linking; the installer detects them and, with

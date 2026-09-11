@@ -729,11 +729,21 @@ dk_sdk() {
 }
 
 dk_ensure_sdkman() {
-  DK_BASH=$(dk_find_bash4) || {
+  DK_BASH=$(dk_find_bash4) || DK_BASH=""
+  # stock macOS only has bash 3.2, and nothing else here can supply a newer one
+  if [ -z "$DK_BASH" ] && [ "$DK_OS" = darwin ] && command -v brew >/dev/null 2>&1; then
+    dk_step "installing bash (SDKMAN needs bash >= 4; macOS ships 3.2)"
+    if ! brew install bash > "$DK_TMP/brew-bash.log" 2>&1; then
+      dk_warn "brew install bash failed:"
+      sed -n '1,10p' "$DK_TMP/brew-bash.log" >&2
+    fi
+    DK_BASH=$(dk_find_bash4) || DK_BASH=""
+  fi
+  if [ -z "$DK_BASH" ]; then
     dk_err "SDKMAN needs bash >= 4 and none was found (this shell: ${BASH_VERSION:-unknown})"
     dk_info "install one and re-run -- on macOS: brew install bash"
     return 1
-  }
+  fi
   dk_info "driving SDKMAN with $DK_BASH"
   if [ ! -s "$SDKMAN_DIR/bin/sdkman-init.sh" ]; then
     dk_step "installing SDKMAN"

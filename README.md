@@ -194,6 +194,8 @@ Use-Jdk 25 -Persist           # 顺便设成新会话的默认值
 ## 说明
 
 - Bash 脚本按机器自带的 bash 写（包括 macOS 的 `bash 3.2`）。
+- macOS 上装 `jdk` / `maven` / `gradle` 需要 bash ≥ 4（SDKMAN 5.23 起强制要求，而系统自带 3.2）。
+  有 Homebrew 时 dev-kit 会自动 `brew install bash`，并且只用它来跑 SDKMAN，不改你的登录 shell。
 - Windows 脚本支持 Windows PowerShell **5.1** 和 PowerShell 7。profile 加载不了时，
   它会提示 `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`。
 - Windows 上的 Rust 链接需要 MSVC C++ 生成工具，脚本会检测；有 `winget` 时会问你要不要装。

@@ -202,8 +202,12 @@ dk_fetch() {
 }
 
 # first "key":"value" out of JSON on stdin
+#
+# `sed -n 1p`, not `head -1`, on purpose (same below): head closes the pipe after
+# the first line, the producer dies on SIGPIPE, and under `set -o pipefail` the
+# pipeline then reports failure even though the value was read fine. sed drains.
 dk_json_str() {
-  grep -oE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed -E 's/.*:[[:space:]]*"//; s/"$//'
+  grep -oE "\"$1\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | sed -n '1p' | sed -E 's/.*:[[:space:]]*"//; s/"$//'
 }
 
 # compare version-like strings by their numeric groups; true if $1 > $2
@@ -243,7 +247,7 @@ dk_extract_to() {
     mv "$tmp/$top" "$dest"
   else
     cnt=$(ls -1 "$tmp" | wc -l | tr -d ' ')
-    only=$(ls -1 "$tmp" | head -1)
+    only=$(ls -1 "$tmp" | sed -n '1p')
     if [ "$cnt" = 1 ] && [ -d "$tmp/$only" ]; then
       mv "$tmp/$only" "$dest"
     else
@@ -928,7 +932,7 @@ dk_c_go() {
   if [ -n "$DK_GO_VERSION" ]; then
     ver="go$DK_GO_VERSION"
   else
-    ver=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"go[0-9.]+"' "$jsonf" | head -1 | sed -E 's/.*"(go[0-9.]+)".*/\1/') || ver=""
+    ver=$(grep -oE '"version"[[:space:]]*:[[:space:]]*"go[0-9.]+"' "$jsonf" | sed -n '1p' | sed -E 's/.*"(go[0-9.]+)".*/\1/') || ver=""
   fi
   [ -n "$ver" ] || { dk_err "cannot resolve Go version"; return 1; }
   file="$ver.$DK_OS-$DK_GOARCH.tar.gz"
@@ -1042,8 +1046,8 @@ dk_install_fnm() {
   dk_fetch "$url" "$DK_TMP/fnm.zip"
   tmp="$DK_TMP/fnmx"; rm -rf "$tmp"; mkdir -p "$tmp"
   unzip -q "$DK_TMP/fnm.zip" -d "$tmp"
-  bin=$(find "$tmp" -type f -name fnm | head -1)
-  [ -n "$bin" ] || bin=$(find "$tmp" -type f | head -1)
+  bin=$(find "$tmp" -type f -name fnm | sed -n '1p')
+  [ -n "$bin" ] || bin=$(find "$tmp" -type f | sed -n '1p')
   [ -n "$bin" ] || { dk_err "fnm binary not found"; return 1; }
   mkdir -p "$DK_DATA_DIR/bin"
   mv -f "$bin" "$DK_DATA_DIR/bin/fnm"
@@ -1112,7 +1116,7 @@ dk_c_pnpm() {
   local reg ver cur plat arch pkg tmp
   reg="https://registry.npmjs.org"
   [ "$DK_MIRROR" = cn ] && reg="https://registry.npmmirror.com"
-  ver=$(curl -fsSL -m 20 "$reg/pnpm/latest" 2>/dev/null | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9.]+"' | head -1 | sed -E 's/.*"([0-9.]+)".*/\1/') || ver=""
+  ver=$(curl -fsSL -m 20 "$reg/pnpm/latest" 2>/dev/null | grep -oE '"version"[[:space:]]*:[[:space:]]*"[0-9.]+"' | sed -n '1p' | sed -E 's/.*"([0-9.]+)".*/\1/') || ver=""
   [ -n "$ver" ] || { dk_err "cannot resolve pnpm version"; return 1; }
 
   cur=""
@@ -1166,7 +1170,7 @@ dk_bun_tag() {
       | grep -oE 'bun-v[0-9]+\.[0-9]+\.[0-9]+' | sort -u | dk_ver_max
   else
     curl -fsSL -m 20 "https://api.github.com/repos/oven-sh/bun/releases/latest" 2>/dev/null \
-      | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/'
+      | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed -n '1p' | sed -E 's/.*"([^"]*)"$/\1/'
   fi
 }
 
@@ -1191,7 +1195,7 @@ dk_c_bun() {
   dk_fetch "$url" "$DK_TMP/bun.zip"
   tmp="$DK_TMP/bunx"; rm -rf "$tmp"; mkdir -p "$tmp"
   unzip -q "$DK_TMP/bun.zip" -d "$tmp"
-  bin=$(find "$tmp" -type f -name bun | head -1)
+  bin=$(find "$tmp" -type f -name bun | sed -n '1p')
   [ -n "$bin" ] || { dk_err "bun binary not found in archive"; return 1; }
   mkdir -p "$BUN_INSTALL/bin"
   mv -f "$bin" "$BUN_INSTALL/bin/bun"
@@ -1305,7 +1309,7 @@ dk_doctor_row() {
   local label=$1 path=$2; shift 2
   local ver=""
   if [ -x "$path" ] || command -v "$path" >/dev/null 2>&1; then
-    ver=$("$@" 2>&1 | head -1) || ver=""
+    ver=$("$@" 2>&1 | sed -n '1p') || ver=""
     printf '  %s%-8s%s %s\n' "$C_GRN" "$label" "$C_RST" "$ver" >&2
   fi
 }

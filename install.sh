@@ -64,6 +64,7 @@ DK_NO_SUDO=0
 DK_TMP=""
 DK_FAILED=""
 DK_SDKMAN_OK=0
+DK_BASH=""            # a bash >= 4 to drive SDKMAN with (see dk_find_bash4)
 DK_JDK_MAJORS=""
 DK_JDK_DEFAULT=""
 
@@ -694,31 +695,54 @@ dk_sdkman_config() {
   dk_set_kv "$cfg" sdkman_curl_connect_timeout 15
 }
 
+# SDKMAN 5.23 refuses to install on bash 3, and its runtime uses ${var^^}
+# (src/sdkman-path-helpers.sh) -- so the bash 3.2 that macOS ships cannot drive
+# it at all. Find a bash >= 4 and run everything SDKMAN through that, instead of
+# sourcing sdkman-init.sh into this shell.
+dk_find_bash4() {
+  local c v
+  for c in "${BASH:-}" bash /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash /bin/bash; do
+    [ -n "$c" ] || continue
+    v=$("$c" -c 'printf %s "${BASH_VERSINFO[0]}"' 2>/dev/null) || continue
+    case "$v" in ''|*[!0-9]*) continue;; esac
+    if [ "$v" -ge 4 ]; then printf '%s' "$c"; return 0; fi
+  done
+  return 1
+}
+
 dk_sdkman_load() {
   [ -s "$SDKMAN_DIR/bin/sdkman-init.sh" ] || return 1
-  set +e +u
-  # shellcheck disable=SC1090,SC1091
-  . "$SDKMAN_DIR/bin/sdkman-init.sh"
-  set -e -u
-  command -v sdk >/dev/null 2>&1 || return 1
+  [ -n "$DK_BASH" ] || return 1
+  SDKMAN_DIR="$SDKMAN_DIR" "$DK_BASH" -c \
+    '. "$SDKMAN_DIR/bin/sdkman-init.sh"; command -v sdk >/dev/null' >/dev/null 2>&1
 }
 
 # run an sdk command tolerantly (sdk internals are not set -e/-u clean)
 dk_sdk() {
   local rc
-  set +e +u
-  # shellcheck disable=SC2209
-  PAGER=cat sdk "$@" </dev/null
+  set +e
+  SDKMAN_DIR="$SDKMAN_DIR" PAGER=cat "$DK_BASH" -c \
+    'set +u; . "$SDKMAN_DIR/bin/sdkman-init.sh"; sdk "$@"' dk-sdk "$@" </dev/null
   rc=$?
-  set -e -u
+  set -e
   return "$rc"
 }
 
 dk_ensure_sdkman() {
+  DK_BASH=$(dk_find_bash4) || {
+    dk_err "SDKMAN needs bash >= 4 and none was found (this shell: ${BASH_VERSION:-unknown})"
+    dk_info "install one and re-run -- on macOS: brew install bash"
+    return 1
+  }
+  dk_info "driving SDKMAN with $DK_BASH"
   if [ ! -s "$SDKMAN_DIR/bin/sdkman-init.sh" ]; then
     dk_step "installing SDKMAN"
-    if ! curl -fsSL "https://get.sdkman.io?rcupdate=false&ci=true" | SDKMAN_DIR="$SDKMAN_DIR" bash >/dev/null 2>&1; then
-      dk_err "SDKMAN install failed"; return 1
+    dk_fetch "https://get.sdkman.io?rcupdate=false&ci=true" "$DK_TMP/sdkman-install.sh" || return 1
+    if ! SDKMAN_DIR="$SDKMAN_DIR" "$DK_BASH" "$DK_TMP/sdkman-install.sh" \
+         > "$DK_TMP/sdkman-install.log" 2>&1; then
+      dk_err "SDKMAN install failed:"
+      sed -n '1,15p' "$DK_TMP/sdkman-install.log" >&2
+      return 1
     fi
   fi
   dk_sdkman_config
